@@ -73,6 +73,7 @@ func GetCallOptions(opts []grpc.CallOption) *CallOptions {
 			copts.MaxRecv = o.MaxRecvMsgSize
 		case grpc.MaxSendMsgSizeCallOption:
 			copts.MaxSend = o.MaxSendMsgSize
+		case grpc.CompressorCallOption:
 		}
 	}
 	return &copts

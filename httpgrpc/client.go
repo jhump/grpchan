@@ -419,8 +419,8 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 		return
 	}
 	defer func() {
-		ioutil.ReadAll(reply.Body)
-		reply.Body.Close()
+		_, _ = io.ReadAll(reply.Body)
+		_ = reply.Body.Close()
 	}()
 
 	if len(cs.copts.Peer) > 0 {
