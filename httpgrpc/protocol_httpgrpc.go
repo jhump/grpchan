@@ -6,29 +6,32 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
+
 	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
 	grpcproto "google.golang.org/grpc/encoding/proto"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"io"
-	"net/http"
-	"strings"
 )
 
 type httpgrpcClientProtocolAdapter struct{}
 
 var _ clientProtocolAdapter = httpgrpcClientProtocolAdapter{}
 
-func (h httpgrpcClientProtocolAdapter) unaryMessage(data []byte, _ bool) (io.Reader, error) {
-	return bytes.NewReader(data), nil
+func (h httpgrpcClientProtocolAdapter) unaryMessage(data []byte, _ bool) ([][]byte, error) {
+	return [][]byte{data}, nil
 }
 
-func (h httpgrpcClientProtocolAdapter) streamMessage(data []byte, _ bool) (io.Reader, error) {
-	prefix := bytes.NewBuffer(make([]byte, 4))
-	_ = binary.Write(prefix, binary.BigEndian, int32(len(data)))
-	return io.MultiReader(prefix, bytes.NewReader(data)), nil
+func (h httpgrpcClientProtocolAdapter) streamMessage(data []byte, _ bool) ([][]byte, error) {
+	var buf [4]byte
+	if _, err := binary.Encode(buf[:], binary.BigEndian, int32(len(data))); err != nil {
+		return nil, err
+	}
+	return [][]byte{buf[:], data}, nil
 }
 
 func (h httpgrpcClientProtocolAdapter) supportsCompression() bool {
@@ -132,14 +135,16 @@ type httpgrpcServerProtocolAdapter struct {
 
 var _ serverProtocolAdapter = &httpgrpcServerProtocolAdapter{}
 
-func (h *httpgrpcServerProtocolAdapter) unaryMessage(data []byte, _ bool) (io.Reader, error) {
-	return bytes.NewReader(data), nil
+func (h *httpgrpcServerProtocolAdapter) unaryMessage(data []byte, _ bool) ([][]byte, error) {
+	return [][]byte{data}, nil
 }
 
-func (h *httpgrpcServerProtocolAdapter) streamMessage(data []byte, _ bool) (io.Reader, error) {
-	var prefix bytes.Buffer
-	_ = binary.Write(&prefix, binary.BigEndian, int32(len(data)))
-	return io.MultiReader(&prefix, bytes.NewReader(data)), nil
+func (h *httpgrpcServerProtocolAdapter) streamMessage(data []byte, _ bool) ([][]byte, error) {
+	var buf [4]byte
+	if _, err := binary.Encode(buf[:], binary.BigEndian, int32(len(data))); err != nil {
+		return nil, err
+	}
+	return [][]byte{buf[:], data}, nil
 }
 
 func (h *httpgrpcServerProtocolAdapter) processHeaders(ctx context.Context, header http.Header) (_ context.Context, _ context.CancelFunc, compressorName string, supportedCompressors []string, _ error) {

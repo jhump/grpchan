@@ -1,6 +1,7 @@
 package httpgrpc
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"mime"
@@ -39,6 +40,9 @@ const (
 	// override the default encoder with a custom encoder.
 	//
 	// This is coincidentally used by both "connect" and "httpgrpc" protocols.
+	// When this content-type is used, the protocol is distinguished between
+	// these two using a "Connect-Protocol-Version": if it is present, the
+	// connect protocol is used; otherwise the httpgrpc protocol is used.
 	ApplicationJson = "application/json"
 )
 
@@ -70,7 +74,7 @@ type protocolAdapter interface {
 	//
 	// This method is called for encoding the request and the response only if the
 	// RPC is a unary operation.
-	unaryMessage(data []byte, compressed bool) (io.Reader, error)
+	unaryMessage(data []byte, compressed bool) ([][]byte, error)
 	// streamMessage encodes the given message into a "frame" for the protocol. The
 	// given parameters are the encoded message bytes and a flag indicating whether
 	// the bytes are compressed. The response is a reader, from which the framed
@@ -79,7 +83,7 @@ type protocolAdapter interface {
 	// This method is called if the RPC is not a unary operation. So, even if a
 	// single direction is unary (for example, in a client streaming operation, the
 	// server response is unary) this method is used for both requests and responses.
-	streamMessage(data []byte, compressed bool) (io.Reader, error)
+	streamMessage(data []byte, compressed bool) ([][]byte, error)
 }
 
 // clientProtocolAdapter provides the methods needed to implement the client side of
@@ -153,7 +157,7 @@ func determineProtocolAdapter(contentType string, req *http.Request, opts handle
 		// Both connect and httpgrpc protocols can use this content type.
 		// So we must look at another header to distinguish.
 		if connectVersion := req.Header.Get("Connect-Protocol-Version"); connectVersion != "" {
-			return connectAdapter, "json", true, false, nil
+			return connectServerProtocolAdapter{}, "json", true, false, nil
 		}
 		return &httpgrpcServerProtocolAdapter{errFunc: opts.errFunc, jsonErr: true}, "json", true, false, nil
 	case mediaType == UnaryRpcContentType_V1:
@@ -163,21 +167,28 @@ func determineProtocolAdapter(contentType string, req *http.Request, opts handle
 	}
 
 	protocolType, subFormatType := mediaType, "proto"
-	pos := strings.IndexRune(mediaType, '+')
-	if pos != -1 {
+	if pos := strings.IndexRune(mediaType, '+'); pos != -1 {
 		protocolType = mediaType[:pos]
 		subFormatType = mediaType[pos+1:]
 	}
 	switch protocolType {
 	case GrpcWebContentType:
-		return grpcWebAdapter, subFormatType, true, true, nil
+		return grpcWebServerProtocolAdapter{}, subFormatType, true, true, nil
 	case ConnectContentType:
-		return connectAdapter, subFormatType, false, true, nil
+		return connectServerProtocolAdapter{}, subFormatType, false, true, nil
 	default:
 		subFormatType = strings.TrimPrefix(mediaType, "application/")
 		if subFormatType == mediaType {
 			return nil, "", false, false, nil
 		}
-		return connectAdapter, subFormatType, true, false, nil
+		return connectServerProtocolAdapter{}, subFormatType, true, false, nil
 	}
+}
+
+func readerFromByteSlices(data [][]byte) io.Reader {
+	readers := make([]io.Reader, len(data))
+	for i := range data {
+		readers[i] = bytes.NewReader(data[i])
+	}
+	return io.MultiReader(readers...)
 }

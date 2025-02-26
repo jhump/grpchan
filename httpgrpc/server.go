@@ -147,7 +147,9 @@ type handlerOpts struct {
 // ErrorRenderer returns a HandlerOption that will cause the handler to use the
 // given function to render an error.  It is only used for unary RPCs since
 // streaming RPCs serialize a status message to the response trailer (in the
-// HTTP body) instead.
+// HTTP body) instead. Also, it is only used for httpgrpc protocol since the
+// other protocols, grpc-web and connect, both have strict specifications for
+// how errors are rendered.
 //
 // The function should call methods on response in order to write an error
 // response, including any response headers, the HTTP status code, and any
@@ -162,27 +164,28 @@ func ErrorRenderer(errFunc func(reqCtx context.Context, st *status.Status, respo
 
 // DefaultErrorRenderer translates the gRPC code in the given status to an HTTP
 // error response. The following table shows how status codes are translated:
-//   Canceled:         * 502 Bad Gateway
-//   Unknown:            500 Internal Server Error
-//   InvalidArgument:    400 Bad Request
-//   DeadlineExceeded: * 504 Gateway Timeout
-//   NotFound:           404 Not Found
-//   AlreadyExists:      409 Conflict
-//   PermissionDenied:   403 Forbidden
-//   Unauthenticated:    401 Unauthorized
-//   ResourceExhausted:  429 Too Many Requests
-//   FailedPrecondition: 412 Precondition Failed
-//   Aborted:            409 Conflict
-//   OutOfRange:         422 Unprocessable Entity
-//   Unimplemented:      501 Not Implemented
-//   Internal:           500 Internal Server Error
-//   Unavailable:        503 Service Unavailable
-//   DataLoss:           500 Internal Server Error
 //
-//   * If the gRPC status indicates Canceled or DeadlineExceeded
-//     and the given request context ALSO indicates a context error
-//     (meaning that the request was cancelled by the client), then
-//     a 499 Client Closed Request code is used instead.
+//	Canceled:         * 502 Bad Gateway
+//	Unknown:            500 Internal Server Error
+//	InvalidArgument:    400 Bad Request
+//	DeadlineExceeded: * 504 Gateway Timeout
+//	NotFound:           404 Not Found
+//	AlreadyExists:      409 Conflict
+//	PermissionDenied:   403 Forbidden
+//	Unauthenticated:    401 Unauthorized
+//	ResourceExhausted:  429 Too Many Requests
+//	FailedPrecondition: 412 Precondition Failed
+//	Aborted:            409 Conflict
+//	OutOfRange:         422 Unprocessable Entity
+//	Unimplemented:      501 Not Implemented
+//	Internal:           500 Internal Server Error
+//	Unavailable:        503 Service Unavailable
+//	DataLoss:           500 Internal Server Error
+//
+//	* If the gRPC status indicates Canceled or DeadlineExceeded
+//	  and the given request context ALSO indicates a context error
+//	  (meaning that the request was cancelled by the client), then
+//	  a 499 Client Closed Request code is used instead.
 //
 // If any other gRPC status code is observed, it would get translated into a
 // 500 Internal Server Error.

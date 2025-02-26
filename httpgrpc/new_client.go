@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/fullstorydev/grpchan/internal"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/encoding"
-	grpcproto "google.golang.org/grpc/encoding/proto"
+	"google.golang.org/grpc/status"
 	"io"
-	"io/ioutil"
+	"math"
 	"net/http"
 	"net/url"
 	"path"
 	"runtime"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/encoding"
+	grpcproto "google.golang.org/grpc/encoding/proto"
+
+	"github.com/fullstorydev/grpchan/internal"
 )
 
 type ChannelOption func(*channelOptions)
@@ -25,12 +28,11 @@ func WithConnect() ChannelOption {
 	}
 }
 
-// TODO: uncomment this once grpcweb is supported
-//func WithGRPCWeb() ChannelOption {
-//	return func(opts *channelOptions) {
-//		opts.protocol = grpcWebClientAdapter{}
-//	}
-//}
+func WithGRPCWeb() ChannelOption {
+	return func(opts *channelOptions) {
+		opts.protocol = grpcWebClientProtocolAdapter{}
+	}
+}
 
 type channelOptions struct {
 	protocol            clientProtocolAdapter
@@ -105,7 +107,7 @@ func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp in
 		return err
 	}
 	if len(b) > copts.MaxSend {
-		// TODO: fail
+		return status.Errorf(codes.ResourceExhausted, "payload too large: %v > %v", len(b), copts.MaxSend)
 	}
 	if ch.compressor != nil {
 		var buf bytes.Buffer
@@ -121,6 +123,9 @@ func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp in
 		}
 		b = buf.Bytes()
 	}
+	if len(b) > copts.MaxSend {
+		return status.Errorf(codes.ResourceExhausted, "payload too large: %v > %v", len(b), copts.MaxSend)
+	}
 
 	// NB: The current interface of clientProtocolAdapter doesn't allow for a future
 	// where connect can support GET or QUERY requests for idempotent/cacheable RPCs.
@@ -130,7 +135,7 @@ func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp in
 	if err != nil {
 		return err
 	}
-	r, err := http.NewRequest("POST", reqUrlStr, body)
+	r, err := http.NewRequest("POST", reqUrlStr, readerFromByteSlices(body))
 	if err != nil {
 		return err
 	}
@@ -139,7 +144,6 @@ func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp in
 	if err != nil {
 		return statusFromContextError(err)
 	}
-	// TODO: enforce max send and receive size in call options
 
 	// we fire up a goroutine to read the response so that we can properly
 	// respect any context deadline (e.g. don't want to be blocked, reading
@@ -147,9 +151,17 @@ func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp in
 	respCh := make(chan struct{})
 	go func() {
 		defer close(respCh)
-		io.ReadAtLeast()
-		b, err = ioutil.ReadAll(reply.Body)
-		reply.Body.Close()
+		reader := io.Reader(reply.Body)
+		if copts.MaxRecv > 0 && copts.MaxRecv != math.MaxUint64 {
+			// We limit to one higher than the limit so we can tell below
+			// if the payload was actually > limit.
+			reader = io.LimitReader(reply.Body, int64(copts.MaxRecv)+1)
+		}
+		b, err = io.ReadAll(reader)
+		if err == nil && copts.MaxRecv > 0 && len(b) > copts.MaxRecv {
+			err = status.Errorf(codes.ResourceExhausted, "response payload too large to receive: %v > %v", len(b), copts.MaxRecv)
+		}
+		_ = reply.Body.Close()
 	}()
 
 	if len(copts.Peer) > 0 {
@@ -175,7 +187,8 @@ func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp in
 	if err != nil {
 		return err
 	}
-	return codec.Unmarshal(b, resp)
+	// TODO: maybe decompress response
+	return ch.codec.Unmarshal(b, resp)
 }
 
 // NewStream satisfies the grpchan.Channel interface and supports sending
@@ -198,13 +211,14 @@ func (ch *ChannelV2) NewStream(ctx context.Context, desc *grpc.StreamDesc, metho
 
 	// Intercept r.Close() so we can control the error sent across to the writer thread.
 	r, w := io.Pipe()
-	req, err := http.NewRequest("POST", reqUrlStr, ioutil.NopCloser(r))
+	req, err := http.NewRequest("POST", reqUrlStr, io.NopCloser(r))
 	if err != nil {
 		cancel()
 		return nil, err
 	}
 	req.Header = h
 
+	// TODO: Need a newClientStreamV2
 	cs := newClientStream(ctx, cancel, w, desc.ServerStreams, copts, ch.BaseURL)
 	go cs.doHttpCall(ch.Transport, req, r)
 

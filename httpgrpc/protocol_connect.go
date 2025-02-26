@@ -1,7 +1,6 @@
 package httpgrpc
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
@@ -10,30 +9,65 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
-// NB: This is nil, so if protocol detection sees connect, it will
-// result in unsupported media type error.
-// TODO: Make this real by implementing the type below
-var connectAdapter serverProtocolAdapter
-
 type connectServerProtocolAdapter struct{}
+
+func (c connectServerProtocolAdapter) unaryMessage(data []byte, compressed bool) ([][]byte, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c connectServerProtocolAdapter) streamMessage(data []byte, compressed bool) ([][]byte, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c connectServerProtocolAdapter) processHeaders(ctx context.Context, header http.Header) (_ context.Context, _ context.CancelFunc, compressorName string, supportedCompressors []string, _ error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c connectServerProtocolAdapter) responseHeaders(isStream bool, codecName string, compressorName string, md metadata.MD, targetHeaders http.Header) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c connectServerProtocolAdapter) processUnaryRequest(closer io.ReadCloser) (io.ReadCloser, bool, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c connectServerProtocolAdapter) finishUnary(ctx context.Context, err error, trailers metadata.MD, w http.ResponseWriter) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c connectServerProtocolAdapter) readStreamRequest(closer io.ReadCloser) (io.Reader, bool, error) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (c connectServerProtocolAdapter) finishStream(err error, trailers metadata.MD, w http.ResponseWriter) {
+	//TODO implement me
+	panic("implement me")
+}
 
 type connectClientProtocolAdapter struct{}
 
 var _ clientProtocolAdapter = connectClientProtocolAdapter{}
 
-func (c connectClientProtocolAdapter) unaryMessage(data []byte, _ bool) (io.Reader, error) {
-	return bytes.NewReader(data), nil
+func (c connectClientProtocolAdapter) unaryMessage(data []byte, _ bool) ([][]byte, error) {
+	return [][]byte{data}, nil
 }
 
-func (c connectClientProtocolAdapter) streamMessage(data []byte, compressed bool) (io.Reader, error) {
-	prefix := bytes.NewBuffer(make([]byte, 5))
-	var encodingByte byte
+func (c connectClientProtocolAdapter) streamMessage(data []byte, compressed bool) ([][]byte, error) {
+	var buf [5]byte
 	if compressed {
-		encodingByte = 1
+		buf[0] = 1
 	}
-	_ = prefix.WriteByte(encodingByte)
-	_ = binary.Write(prefix, binary.BigEndian, int32(len(data)))
-	return io.MultiReader(prefix, bytes.NewReader(data)), nil
+	if _, err := binary.Encode(buf[1:], binary.BigEndian, int32(len(data))); err != nil {
+		return nil, err
+	}
+	return [][]byte{buf[:], data}, nil
 }
 
 func (c connectClientProtocolAdapter) supportsCompression() bool {
@@ -59,5 +93,3 @@ func (c connectClientProtocolAdapter) readStreamResponse(r io.ReadCloser) (io.Re
 	//TODO implement me
 	panic("implement me")
 }
-
-var _ clientProtocolAdapter = connectClientProtocolAdapter{}
