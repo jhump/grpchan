@@ -79,7 +79,7 @@ func (c connectClientProtocolAdapter) requestHeaders(ctx context.Context, isStre
 	panic("implement me")
 }
 
-func (c connectClientProtocolAdapter) processUnaryResponse(resp *http.Response) (metadata.MD, io.Reader, bool, metadata.MD, error) {
+func (c connectClientProtocolAdapter) processUnaryResponse(resp *http.Response) (metadata.MD, io.Reader, string, string, metadata.MD, error) {
 	//TODO implement me
 	panic("implement me")
 }

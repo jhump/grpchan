@@ -105,7 +105,7 @@ type clientProtocolAdapter interface {
 	// indicates a non-OK RPC status code. If the given error is non-nil, the response
 	// message should be nil but the header and trailer metadata may be populated. This
 	// is only called for unary operations.
-	processUnaryResponse(resp *http.Response) (metadata.MD, io.Reader, bool, metadata.MD, error)
+	processUnaryResponse(resp *http.Response) (headers metadata.MD, msg io.Reader, codecName string, compressorName string, trailers metadata.MD, err error)
 	// processStreamHeeaders processes the given stream response into header metadata and
 	// an optional error indicating whether the RPC already failed. This is only called for
 	// stream operations, and will be combined with calls to readStreamResponse.

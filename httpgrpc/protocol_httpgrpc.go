@@ -60,10 +60,10 @@ func (h httpgrpcClientProtocolAdapter) requestHeaders(ctx context.Context, isStr
 	return hdrs, nil
 }
 
-func (h httpgrpcClientProtocolAdapter) processUnaryResponse(resp *http.Response) (metadata.MD, io.Reader, bool, metadata.MD, error) {
+func (h httpgrpcClientProtocolAdapter) processUnaryResponse(resp *http.Response) (metadata.MD, io.Reader, string, string, metadata.MD, error) {
 	hdr, err := asMetadata(resp.Header)
 	if err != nil {
-		return nil, nil, false, nil, err
+		return nil, nil, "", "", nil, err
 	}
 	tlr := metadata.MD{}
 
@@ -80,7 +80,7 @@ func (h httpgrpcClientProtocolAdapter) processUnaryResponse(resp *http.Response)
 	}
 
 	stat := statFromResponse(resp)
-	return hdr, resp.Body, false, tlr, stat.Err()
+	return hdr, resp.Body, "", tlr, stat.Err()
 }
 
 func (h httpgrpcClientProtocolAdapter) processStreamHeaders(resp *http.Response) (metadata.MD, error) {

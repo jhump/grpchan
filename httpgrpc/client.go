@@ -86,8 +86,8 @@ func (ch *Channel) Invoke(ctx context.Context, methodName string, req, resp inte
 	respCh := make(chan struct{})
 	go func() {
 		defer close(respCh)
-		b, err = ioutil.ReadAll(reply.Body)
-		reply.Body.Close()
+		b, err = io.ReadAll(reply.Body)
+		_ = reply.Body.Close()
 	}()
 
 	if len(copts.Peer) > 0 {

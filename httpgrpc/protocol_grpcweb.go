@@ -72,7 +72,7 @@ func (g grpcWebClientProtocolAdapter) requestHeaders(ctx context.Context, isStre
 	panic("implement me")
 }
 
-func (g grpcWebClientProtocolAdapter) processUnaryResponse(resp *http.Response) (metadata.MD, io.Reader, bool, metadata.MD, error) {
+func (g grpcWebClientProtocolAdapter) processUnaryResponse(resp *http.Response) (metadata.MD, io.Reader, string, string, metadata.MD, error) {
 	//TODO implement me
 	panic("implement me")
 }

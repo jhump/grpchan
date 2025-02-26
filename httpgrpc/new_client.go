@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"google.golang.org/grpc/status"
 	"io"
 	"math"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/encoding"
 	grpcproto "google.golang.org/grpc/encoding/proto"
+	"google.golang.org/grpc/status"
 
 	"github.com/fullstorydev/grpchan/internal"
 )
@@ -144,6 +144,15 @@ func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp in
 	if err != nil {
 		return statusFromContextError(err)
 	}
+	headers, msg, codecName, compressorName, trailers, err := ch.protocol.processUnaryResponse(reply)
+	if err != nil {
+		_ = reply.Body.Close()
+		return err
+	}
+	if codecName != ch.codec.Name() {
+		_ = reply.Body.Close()
+		return status.Errorf(codes.Internal, "unexpected codec name: %v; expecting %v", codecName, ch.codec.Name())
+	}
 
 	// we fire up a goroutine to read the response so that we can properly
 	// respect any context deadline (e.g. don't want to be blocked, reading
@@ -151,13 +160,12 @@ func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp in
 	respCh := make(chan struct{})
 	go func() {
 		defer close(respCh)
-		reader := io.Reader(reply.Body)
 		if copts.MaxRecv > 0 && copts.MaxRecv != math.MaxUint64 {
 			// We limit to one higher than the limit so we can tell below
 			// if the payload was actually > limit.
-			reader = io.LimitReader(reply.Body, int64(copts.MaxRecv)+1)
+			msg = io.LimitReader(reply.Body, int64(copts.MaxRecv)+1)
 		}
-		b, err = io.ReadAll(reader)
+		b, err = io.ReadAll(msg)
 		if err == nil && copts.MaxRecv > 0 && len(b) > copts.MaxRecv {
 			err = status.Errorf(codes.ResourceExhausted, "response payload too large to receive: %v > %v", len(b), copts.MaxRecv)
 		}
@@ -169,15 +177,8 @@ func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp in
 	}
 
 	// gather headers and trailers
-	if len(copts.Headers) > 0 || len(copts.Trailers) > 0 {
-		if err := setMetadata(reply.Header, copts); err != nil {
-			return err
-		}
-	}
-
-	if stat := statFromResponse(reply); stat.Code() != codes.OK {
-		return stat.Err()
-	}
+	copts.SetHeaders(headers)
+	copts.SetTrailers(trailers)
 
 	select {
 	case <-ctx.Done():
@@ -187,7 +188,21 @@ func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp in
 	if err != nil {
 		return err
 	}
-	// TODO: maybe decompress response
+	if compressorName != "" && compressorName != encoding.Identity {
+		compressor := encoding.GetCompressor(compressorName)
+		if compressor == nil {
+			return status.Errorf(codes.Internal, "unknown compressor name: %v", ch.compressType)
+		}
+		r, err := ch.compressor.Decompress(bytes.NewReader(b))
+		if err != nil {
+			return err
+		}
+		b, err = io.ReadAll(r)
+		if err != nil {
+			return err
+		}
+	}
+
 	return ch.codec.Unmarshal(b, resp)
 }
 
