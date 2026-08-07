@@ -20,7 +20,7 @@
 //
 // # Caveats
 //
-// There are couple of limitations when using this package:
+// There are a couple of limitations when using this package:
 //  1. True bidi streams are not supported. The best that can be done are half-duplex
 //     bidi streams, where the client uploads its entire streaming request and then the
 //     server can reply with a streaming response. Interleaved reading and writing does
