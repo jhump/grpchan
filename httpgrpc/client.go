@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"net/textproto"
@@ -176,8 +177,10 @@ func (ch *Channel) Invoke(ctx context.Context, methodName string, req, resp inte
 		return err
 	}
 	b := buf.Materialize()
-
-	// TODO: enforce max send and receive size in call options
+	maxSend := limitOrDefault(copts.MaxSend, defaultMaxSend)
+	if len(b) > maxSend {
+		return status.Errorf(codes.ResourceExhausted, "payload too large: %v > %v", len(b), maxSend)
+	}
 
 	r, err := http.NewRequest("POST", reqUrlStr, bytes.NewReader(b))
 	if err != nil {
@@ -189,13 +192,34 @@ func (ch *Channel) Invoke(ctx context.Context, methodName string, req, resp inte
 		return statusFromContextError(err)
 	}
 
+	// A unary response has never been bounded, so that is what an unset limit
+	// means here; a streaming one defaults differently.
+	maxRecv := limitOrDefault(copts.MaxRecv, defaultMaxRecvUnary)
+
+	// When the response declares its length, an over-large one can be refused
+	// without reading any of the body at all. ContentLength is -1 when it is not
+	// known, in which case the limited read below is what catches it.
+	if reply.ContentLength > int64(maxRecv) {
+		_ = reply.Body.Close()
+		return status.Errorf(codes.ResourceExhausted, "response payload too large to receive: %v > %v", reply.ContentLength, maxRecv)
+	}
+
 	// we fire up a goroutine to read the response so that we can properly
 	// respect any context deadline (e.g. don't want to be blocked, reading
 	// from socket, long past requested timeout).
 	respCh := make(chan struct{})
 	go func() {
 		defer close(respCh)
-		b, err = io.ReadAll(reply.Body)
+		var msg io.Reader = reply.Body
+		if maxRecv < math.MaxInt32 {
+			// We limit to one higher than the limit so we can tell below
+			// if the payload was actually > limit.
+			msg = io.LimitReader(reply.Body, int64(maxRecv)+1)
+		}
+		b, err = io.ReadAll(msg)
+		if err == nil && len(b) > maxRecv {
+			err = status.Errorf(codes.ResourceExhausted, "response payload too large to receive: %v > %v", len(b), maxRecv)
+		}
 		_ = reply.Body.Close()
 	}()
 
@@ -245,7 +269,8 @@ func (ch *Channel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodN
 
 	ctx, cancel := context.WithCancel(ctx)
 
-	h, newStreamWriter := getHeadersAndWriterForClientStreamingRequest(ctx, chOpts)
+	h, newStreamWriter := getHeadersAndWriterForClientStreamingRequest(ctx, chOpts,
+		limitOrDefault(copts.MaxSend, defaultMaxSend))
 
 	// Intercept r.Close() so we can control the error sent across to the writer thread.
 	r, w := io.Pipe()
@@ -387,9 +412,10 @@ type clientStream struct {
 
 	streamWriter streamWriter
 
-	// detailsCodec unmarshals X-GRPC-Details when a streaming RPC fails before the body
-	// uses the negotiated unary-style encoding (same as Channel.WithJSONEncoding).
-	detailsCodec encoding.CodecV2
+	// codec is the negotiated message encoding (same as Channel.WithJSONEncoding).
+	// It also unmarshals X-GRPC-Details when a streaming RPC fails before the body,
+	// which uses that same unary-style encoding.
+	codec encoding.CodecV2
 
 	// respStream is set to indicate whether client expects stream response; unary if false
 	respStream bool
@@ -424,7 +450,7 @@ func newClientStream(
 	copts *internal.CallOptions,
 	baseUrl *url.URL,
 	streamWriter streamWriter,
-	detailsCodec encoding.CodecV2,
+	codec encoding.CodecV2,
 ) *clientStream {
 	cs := &clientStream{
 		ctx:          ctx,
@@ -432,7 +458,7 @@ func newClientStream(
 		copts:        copts,
 		baseUrl:      baseUrl,
 		streamWriter: streamWriter,
-		detailsCodec: detailsCodec,
+		codec:        codec,
 		w:            w,
 		respStream:   recvStream,
 		rCh:          make(chan streamMsg),
@@ -507,8 +533,44 @@ func (cs *clientStream) SendMsg(m interface{}) error {
 		return io.EOF
 	}
 
+	// The send limit is enforced by the writer, which is where the message is
+	// encoded and so where its size is known without encoding it twice.
 	cs.wErr = cs.streamWriter(m, false)
+	if isLimitError(cs.wErr) {
+		// Mirrors gRPC-Go, which calls finish on the stream for errors that SendMsg
+		// itself produced, since they are the caller's doing rather than a transport
+		// failure. Transport failures are left alone: those surface from RecvMsg,
+		// which is where a caller is expected to look for the real result.
+		cs.endStream(cs.wErr)
+	}
 	return cs.wErr
+}
+
+// endStream records why the RPC ended and tears down the request, so that a
+// stream refused for a size violation does not stay open.
+//
+// The error is recorded first so that it is what a subsequent RecvMsg reports.
+// Cancelling alone would leave the reader to fill in a cancellation instead,
+// which is the mismatch grpc-java has (grpc/grpc-java#11245): a client that
+// exceeded a limit is told the call was cancelled and cannot tell why.
+func (cs *clientStream) endStream(err error) {
+	cs.rMu.Lock()
+	if cs.rErr == nil {
+		cs.rErr = err
+	}
+	cs.done = true
+	cs.rMu.Unlock()
+	cs.cancel()
+}
+
+// endError returns the error to report for a stream whose context has ended. A
+// stream that already knows why it ended reports that instead of the
+// cancellation, which is usually a consequence of it and explains far less.
+func (cs *clientStream) endError() error {
+	if done, err := cs.readErrorIfDone(); done && err != nil {
+		return err
+	}
+	return statusFromContextError(cs.ctx.Err())
 }
 
 func (cs *clientStream) RecvMsg(m interface{}) error {
@@ -518,7 +580,7 @@ func (cs *clientStream) RecvMsg(m interface{}) error {
 
 	select {
 	case <-cs.ctx.Done():
-		return statusFromContextError(cs.ctx.Err())
+		return cs.endError()
 	case msg, ok := <-cs.rCh:
 		if !ok {
 			done, err := cs.readErrorIfDone()
@@ -540,7 +602,7 @@ func (cs *clientStream) RecvMsg(m interface{}) error {
 			// it's available for a subsequent call to Trailer)
 			select {
 			case <-cs.ctx.Done():
-				return statusFromContextError(cs.ctx.Err())
+				return cs.endError()
 			case _, ok := <-cs.rCh:
 				if ok {
 					// server tried to send >1 message!
@@ -578,20 +640,51 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 	// which signals to client code that we've reached end-of-stream.
 
 	var rErr error
+	var reply *http.Response
 	rMuHeld := false
+	cancelOnDone := false
 
 	defer func() {
-		if !rMuHeld {
-			cs.rMu.Lock()
-		}
-		defer cs.rMu.Unlock()
+		func() {
+			if !rMuHeld {
+				cs.rMu.Lock()
+			}
+			defer cs.rMu.Unlock()
 
-		if rErr != nil && cs.rErr == nil {
-			cs.rErr = rErr
+			if rErr != nil && cs.rErr == nil {
+				cs.rErr = rErr
+			}
+			cs.done = true
+			readPipe.CloseWithError(rErr)
+			close(cs.rCh)
+			if cancelOnDone {
+				// After the reason is recorded, never before: a caller that is waiting
+				// on the stream must see it, not the cancellation it causes.
+				cs.cancel()
+			}
+		}()
+
+		if reply == nil {
+			return
 		}
-		cs.done = true
-		readPipe.CloseWithError(rErr)
-		close(cs.rCh)
+		// Read off whatever little is left, so that the connection can be reused. How
+		// far that got is not worth inspecting: net/http pools a connection whose body
+		// reached EOF and drops one whose body did not, so closing does the right thing
+		// either way, and over HTTP/2 it costs only the stream.
+		//
+		// It is skipped when a message was refused for its size, since the preface has
+		// already said that what remains is larger than this process was willing to
+		// hold, which makes it too large to discard as well.
+		//
+		// This runs after the caller has been released above, and outside the lock,
+		// because the body outlives the RPC: a server can report how a stream ended
+		// before its handler returns, and the body stays open until it does. Draining
+		// first would hold the caller for as long as that handler cared to take, which
+		// is the delay that reporting a status early exists to avoid.
+		if !isLimitError(rErr) {
+			_, _ = io.CopyN(io.Discard, reply.Body, drainLimit)
+		}
+		_ = reply.Body.Close()
 	}()
 
 	// Release the round trip if the context ends while the request body is still
@@ -619,15 +712,12 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 		cs.ready.Done()
 	}
 
-	reply, err := transport.RoundTrip(req.WithContext(cs.ctx))
+	var err error
+	reply, err = transport.RoundTrip(req.WithContext(cs.ctx))
 	if err != nil {
 		onReady(statusFromContextError(err), nil)
 		return
 	}
-	defer func() {
-		_, _ = io.ReadAll(reply.Body)
-		_ = reply.Body.Close()
-	}()
 
 	if len(cs.copts.Peer) > 0 {
 		cs.copts.SetPeer(getPeer(cs.baseUrl, reply.TLS))
@@ -640,7 +730,7 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 
 	onReady(nil, md)
 
-	stat := statFromResponse(reply, cs.detailsCodec)
+	stat := statFromResponse(reply, cs.codec)
 	if stat.Code() != codes.OK {
 		statProto := stat.Proto()
 		cs.tr.Code = statProto.Code
@@ -651,7 +741,10 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 
 	contentType := reply.Header.Get("Content-Type")
 	mediaType, _, _ := mime.ParseMediaType(contentType)
-	streamReader := getClientStreamReader(mediaType, reply.Body)
+	// A streaming response has always been bounded by maxMessageSize, which is what
+	// an unset limit means here; a unary one defaults differently.
+	streamReader := getClientStreamReader(mediaType, reply.Body,
+		limitOrDefault(cs.copts.MaxRecv, defaultMaxRecvStream))
 
 	if streamReader == nil {
 		onReady(status.Error(codes.Internal, fmt.Sprintf("unsupported media type: %s", mediaType)), nil)
@@ -660,14 +753,18 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 
 	counter := 0
 	for {
-		// TODO: enforce max send and receive size in call options
-
 		counter++
 		var msg streamMsg
 		msg, rErr = streamReader()
 		if rErr != nil {
 			if rErr == io.EOF {
 				rErr = io.ErrUnexpectedEOF
+			}
+			if isLimitError(rErr) {
+				// gRPC-Go ends the RPC on any receive error, so a stream that has
+				// been sent something too big does not stay open waiting for the
+				// rest of it.
+				cancelOnDone = true
 			}
 			return
 		}

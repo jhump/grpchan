@@ -75,19 +75,23 @@ func getCodecForServerUnaryResponse(contentType string) encoding.CodecV2 {
 
 // getServerStreamReaderAndWriter returns the reader and writer to use to handle a streaming request on
 // the server, based on the Content-Type headers from the incoming request.
-func getServerStreamReaderAndWriter(contentType string, r io.Reader, w io.Writer, flusher flusher) (streamReader, streamWriter, string) {
+func getServerStreamReaderAndWriter(contentType string, r io.Reader, w io.Writer, flusher flusher, maxRecv, maxSend int) (streamReader, streamWriter, string) {
 	// Ignore any errors or charsets for now, just parse the main type.
 	// TODO: should this be more picky / return an error?  Maybe charset utf8 only?
 	mediaType, _, _ := mime.ParseMediaType(contentType)
 
 	if mediaType == StreamRpcContentType_V1 {
 		codec := encoding.GetCodecV2(grpcproto.Name)
-		return newSizePrefixedReader(r, codec), newSizePrefixedWriter(w, codec), StreamRpcContentType_V1
+		return newSizePrefixedReader(r, codec, maxRecv),
+			newSizePrefixedWriter(w, codec, maxSend),
+			StreamRpcContentType_V1
 	}
 
 	if mediaType == ApplicationJson {
 		codec := encoding.GetCodecV2(jsonCodecName)
-		return newJSONReader(r, codec), newSSEWriter(w, flusher, codec), EventStreamContentType
+		return newJSONReader(r, codec, maxRecv),
+			newSSEWriter(w, flusher, codec, maxSend),
+			EventStreamContentType
 	}
 
 	return nil, nil, ""
@@ -111,38 +115,38 @@ func getHeadersForClientUnaryRequest(ctx context.Context, opts channelOptions) h
 // selects the content type, and here it selects the framing as well: a JSON
 // stream is a sequence of JSON values answered with server-sent events, where a
 // proto stream is size-prefixed in both directions.
-func getHeadersAndWriterForClientStreamingRequest(ctx context.Context, opts channelOptions) (http.Header, func(w io.Writer) streamWriter) {
+func getHeadersAndWriterForClientStreamingRequest(ctx context.Context, opts channelOptions, maxSend int) (http.Header, func(w io.Writer) streamWriter) {
 	h := headersFromContext(ctx)
 	if opts.codecName == jsonCodecName {
 		h.Set("Content-Type", ApplicationJson)
 		h.Set("Accept", EventStreamContentType)
 		return h, func(w io.Writer) streamWriter {
-			return newJSONWriter(w, opts.codec)
+			return newJSONWriter(w, opts.codec, maxSend)
 		}
 	}
 
 	h.Set("Content-Type", StreamRpcContentType_V1)
 	h.Set("Accept", StreamRpcContentType_V1)
 	return h, func(w io.Writer) streamWriter {
-		return newSizePrefixedWriter(w, opts.codec)
+		return newSizePrefixedWriter(w, opts.codec, maxSend)
 	}
 }
 
 // getClientStreamReader returns the reader to use to handle a streaming result on
 // the client, based on the Content-Type header that was returned from the server.
-func getClientStreamReader(contentType string, r io.Reader) streamReader {
+func getClientStreamReader(contentType string, r io.Reader, maxRecv int) streamReader {
 	// Ignore any errors or charsets for now, just parse the main type.
 	// TODO: should this be more picky / return an error?  Maybe charset utf8 only?
 	mediaType, _, _ := mime.ParseMediaType(contentType)
 
 	if mediaType == StreamRpcContentType_V1 {
 		codec := encoding.GetCodecV2(grpcproto.Name)
-		return newSizePrefixedReader(r, codec)
+		return newSizePrefixedReader(r, codec, maxRecv)
 	}
 
 	if mediaType == EventStreamContentType {
 		codec := encoding.GetCodecV2(jsonCodecName)
-		return newSSEReader(r, codec)
+		return newSSEReader(r, codec, maxRecv)
 	}
 
 	return nil

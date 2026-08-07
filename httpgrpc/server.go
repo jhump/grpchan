@@ -359,7 +359,10 @@ func handleStream(svr interface{}, serviceName string, desc *grpc.StreamDesc, st
 
 		contentType := r.Header.Get("Content-Type")
 
-		streamReader, streamWriter, resContentType := getServerStreamReaderAndWriter(contentType, r.Body, w, http.NewResponseController(w))
+		// The server has no configurable limits yet, so it asks for the defaults,
+		// which are the bounds this framing has always had.
+		streamReader, streamWriter, resContentType := getServerStreamReaderAndWriter(
+			contentType, r.Body, w, http.NewResponseController(w), defaultMaxRecvStream, defaultMaxSend)
 		if streamReader == nil || streamWriter == nil {
 			writeError(w, http.StatusUnsupportedMediaType)
 			return
