@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"runtime"
 	"testing"
 	"time"
@@ -22,33 +23,24 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
-func TestGrpcOverHttp(t *testing.T) {
-	svr := &grpchantesting.TestServer{}
+// The httpgrpc protocol cannot support full-duplex bidirectional streams over
+// HTTP 1.1, so every case below runs the suite with supportsFullDuplex false.
+const supportsFullDuplex = false
+
+func TestGRPCOverHTTPV2(t *testing.T) {
 	reg := grpchan.HandlerMap{}
-	grpchantesting.RegisterTestServiceServer(reg, svr)
+	grpchantesting.RegisterTestServiceServer(reg, &grpchantesting.TestServer{})
 
 	var mux http.ServeMux
-	httpgrpc.HandleServices(mux.HandleFunc, "/", reg, nil, nil)
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed it listen on socket: %v", err)
-	}
-	httpServer := http.Server{Handler: &mux}
-	go httpServer.Serve(l)
-	defer httpServer.Close()
+	httpgrpc.HandleServicesV2(mux.HandleFunc, "/", reg, nil, nil)
 
 	// now setup client stub
-	u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", l.Addr().(*net.TCPAddr).Port))
-	if err != nil {
-		t.Fatalf("failed to parse base URL: %v", err)
-	}
-	cc := httpgrpc.Channel{
+	cc := httpgrpc.ChannelV2{
 		Transport: http.DefaultTransport,
-		BaseURL:   u,
+		BaseURL:   serveV2(t, &mux),
 	}
 
-	grpchantesting.RunChannelTestCases(t, &cc, false)
+	grpchantesting.RunChannelTestCases(t, &cc, supportsFullDuplex)
 
 	t.Run("empty-trailer", func(t *testing.T) {
 		// test RPC w/ streaming response where trailer message is empty
@@ -65,104 +57,76 @@ func TestGrpcOverHttp(t *testing.T) {
 			t.Fatalf("server stream should not have returned any messages")
 		}
 	})
-}
 
-// This test is nearly identical to TestGrpcOverHttp, except that it uses
-// *httpgrpc.Server instead of httpgrpc.HandleServices.
-func TestServer(t *testing.T) {
-	errFunc := func(reqCtx context.Context, st *status.Status, response http.ResponseWriter) {
-	}
-
-	svc := &grpchantesting.TestServer{}
-	svr := httpgrpc.NewServer(httpgrpc.WithBasePath("/foo/"), httpgrpc.ErrorRenderer(errFunc))
-	grpchantesting.RegisterTestServiceServer(svr, svc)
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed it listen on socket: %v", err)
-	}
-	httpServer := http.Server{Handler: svr}
-	go httpServer.Serve(l)
-	defer httpServer.Close()
-
-	// now setup client stub
-	u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d/foo/", l.Addr().(*net.TCPAddr).Port))
-	if err != nil {
-		t.Fatalf("failed to parse base URL: %v", err)
-	}
-	cc := httpgrpc.Channel{
-		Transport: http.DefaultTransport,
-		BaseURL:   u,
-	}
-
-	grpchantesting.RunChannelTestCases(t, &cc, false)
-
-	t.Run("empty-trailer", func(t *testing.T) {
-		// test RPC w/ streaming response where trailer message is empty
-		// (e.g. no trailer metadata and code == 0 [OK])
-		cli := grpchantesting.NewTestServiceClient(&cc)
-		str, err := cli.ServerStream(context.Background(), &grpchantesting.Message{})
+	// The cases above pass against either implementation, since the two are wire
+	// compatible. This one does not: a rejected HTTP method is reported in the
+	// protocol's own error format, where the older handlers answer with a bare 405.
+	// It is what pins these handlers to the protocol adapter.
+	t.Run("wrong method", func(t *testing.T) {
+		u := *cc.BaseURL
+		u.Path = path.Join(u.Path, "grpchantesting.TestService/Unary")
+		req, err := http.NewRequest("GET", u.String(), nil)
 		if err != nil {
-			t.Fatalf("failed to initiate server stream: %v", err)
+			t.Fatal(err)
 		}
-		// if there is an issue with trailer message, it will appear to be
-		// a regular message and err would be nil
-		_, err = str.Recv()
-		if err != io.EOF {
-			t.Fatalf("server stream should not have returned any messages")
+		req.Header.Set("Content-Type", "application/x-protobuf")
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("round trip failed: %v", err)
+		}
+		defer resp.Body.Close()
+
+		// The status is reported as "<code>:<message>"; codes.Unimplemented is 12.
+		got := resp.Header.Get("X-GRPC-Status")
+		if got == "" {
+			t.Fatalf("no X-GRPC-Status header: the error did not go through the protocol adapter (HTTP %s)", resp.Status)
+		}
+		if want := fmt.Sprintf("%d:", codes.Unimplemented); len(got) < len(want) || got[:len(want)] != want {
+			t.Errorf("X-GRPC-Status = %q, want code %v", got, codes.Unimplemented)
 		}
 	})
 }
 
-func TestJSONSSEServer(t *testing.T) {
-	errFunc := func(reqCtx context.Context, st *status.Status, response http.ResponseWriter) {
+// This test is nearly identical to TestGrpcOverHttpV2, except that it uses
+// *httpgrpc.ServerV2 instead of httpgrpc.HandleServicesV2. It also exercises
+// both sub-formats; the JSON case covers the server-sent-events framing used
+// for JSON streams.
+func TestServerV2(t *testing.T) {
+	run := func(t *testing.T, opts ...httpgrpc.ChannelV2Option) {
+		t.Helper()
+		cc := newV2(t, v2ServerURL(t), opts...)
+
+		grpchantesting.RunChannelTestCases(t, cc, supportsFullDuplex)
+
+		t.Run("empty-trailer", func(t *testing.T) {
+			// test RPC w/ streaming response where trailer message is empty
+			// (e.g. no trailer metadata and code == 0 [OK])
+			cli := grpchantesting.NewTestServiceClient(cc)
+			str, err := cli.ServerStream(context.Background(), &grpchantesting.Message{})
+			if err != nil {
+				t.Fatalf("failed to initiate server stream: %v", err)
+			}
+			// if there is an issue with trailer message, it will appear to be
+			// a regular message and err would be nil
+			_, err = str.Recv()
+			if err != io.EOF {
+				t.Fatalf("server stream should not have returned any messages")
+			}
+		})
 	}
 
-	svc := &grpchantesting.TestServer{}
-	svr := httpgrpc.NewServer(httpgrpc.WithBasePath("/foo/"), httpgrpc.ErrorRenderer(errFunc))
-	grpchantesting.RegisterTestServiceServer(svr, svc)
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed it listen on socket: %v", err)
-	}
-	httpServer := http.Server{Handler: svr}
-	go httpServer.Serve(l)
-	defer httpServer.Close()
-
-	// now setup client stub
-	u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d/foo/", l.Addr().(*net.TCPAddr).Port))
-	if err != nil {
-		t.Fatalf("failed to parse base URL: %v", err)
-	}
-	cc, err := httpgrpc.NewChannel(u, http.DefaultTransport, httpgrpc.WithJSONEncoding(true))
-	if err != nil {
-		t.Fatalf("failed to create channel: %v", err)
-	}
-
-	grpchantesting.RunChannelTestCases(t, cc, false)
-
-	t.Run("empty-trailer", func(t *testing.T) {
-		// test RPC w/ streaming response where trailer message is empty
-		// (e.g. no trailer metadata and code == 0 [OK])
-		cli := grpchantesting.NewTestServiceClient(cc)
-		str, err := cli.ServerStream(context.Background(), &grpchantesting.Message{})
-		if err != nil {
-			t.Fatalf("failed to initiate server stream: %v", err)
-		}
-		// if there is an issue with trailer message, it will appear to be
-		// a regular message and err would be nil
-		_, err = str.Recv()
-		if err != io.EOF {
-			t.Fatalf("server stream should not have returned any messages")
-		}
+	t.Run("proto", func(t *testing.T) {
+		run(t)
+	})
+	t.Run("json", func(t *testing.T) {
+		run(t, httpgrpc.WithJSONEncodingV2(true))
 	})
 }
 
-// TestUnaryXGrpcDetailsWireCodec asserts that X-GRPC-Details header payloads use
+// TestUnaryXGrpcDetailsWireCodecV2 asserts that X-GRPC-Details header payloads use
 // the same encoding as the unary request body (protobuf vs JSON), so the
 // client recovers google.rpc.Status details correctly for both modes.
-func TestUnaryXGrpcDetailsWireCodec(t *testing.T) {
+func TestUnaryXGRPCDetailsWireCodecV2(t *testing.T) {
 	detailMsg := &structpb.ListValue{
 		Values: []*structpb.Value{
 			{Kind: &structpb.Value_StringValue{StringValue: "x-grpc-details-wire"}},
@@ -173,25 +137,7 @@ func TestUnaryXGrpcDetailsWireCodec(t *testing.T) {
 		t.Fatalf("marshal detail any: %v", err)
 	}
 
-	svc := &grpchantesting.TestServer{}
-	reg := grpchan.HandlerMap{}
-	grpchantesting.RegisterTestServiceServer(reg, svc)
-
-	mux := http.NewServeMux()
-	httpgrpc.HandleServices(mux.HandleFunc, "/", reg, nil, nil)
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	srv := &http.Server{Handler: mux}
-	go srv.Serve(ln)
-	defer srv.Close()
-
-	u, err := url.Parse(fmt.Sprintf("http://%s", ln.Addr().String()))
-	if err != nil {
-		t.Fatalf("parse url: %v", err)
-	}
+	u := v2ServerURL(t)
 
 	mkReq := func() *grpchantesting.Message {
 		return &grpchantesting.Message{
@@ -201,24 +147,21 @@ func TestUnaryXGrpcDetailsWireCodec(t *testing.T) {
 	}
 
 	t.Run("protobuf", func(t *testing.T) {
-		cc := &httpgrpc.Channel{Transport: http.DefaultTransport, BaseURL: u}
+		cc := &httpgrpc.ChannelV2{Transport: http.DefaultTransport, BaseURL: u}
 		cli := grpchantesting.NewTestServiceClient(cc)
 		_, err := cli.Unary(context.Background(), mkReq())
-		assertUnaryErrorHasDetail(t, err, codes.FailedPrecondition, detailMsg)
+		assertUnaryErrorHasDetailV2(t, err, codes.FailedPrecondition, detailMsg)
 	})
 
 	t.Run("json", func(t *testing.T) {
-		cc, err := httpgrpc.NewChannel(u, http.DefaultTransport, httpgrpc.WithJSONEncoding(true))
-		if err != nil {
-			t.Fatalf("failed to create channel: %v", err)
-		}
+		cc := newV2(t, u, httpgrpc.WithJSONEncodingV2(true))
 		cli := grpchantesting.NewTestServiceClient(cc)
-		_, err = cli.Unary(context.Background(), mkReq())
-		assertUnaryErrorHasDetail(t, err, codes.FailedPrecondition, detailMsg)
+		_, err := cli.Unary(context.Background(), mkReq())
+		assertUnaryErrorHasDetailV2(t, err, codes.FailedPrecondition, detailMsg)
 	})
 }
 
-func assertUnaryErrorHasDetail(t *testing.T, err error, wantCode codes.Code, wantDetail proto.Message) {
+func assertUnaryErrorHasDetailV2(t *testing.T, err error, wantCode codes.Code, wantDetail proto.Message) {
 	t.Helper()
 	st, ok := status.FromError(err)
 	if !ok {
@@ -236,24 +179,24 @@ func assertUnaryErrorHasDetail(t *testing.T, err error, wantCode codes.Code, wan
 	}
 }
 
-func TestNewChannelValidation(t *testing.T) {
+func TestNewChannelV2Validation(t *testing.T) {
 	u, err := url.Parse("http://127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("failed to parse base URL: %v", err)
 	}
 
 	t.Run("base URL is required", func(t *testing.T) {
-		if _, err := httpgrpc.NewChannel(nil, http.DefaultTransport); err == nil {
+		if _, err := httpgrpc.NewChannelV2(nil, http.DefaultTransport); err == nil {
 			t.Fatal("expected an error for a nil base URL")
 		}
 	})
 	t.Run("transport is required", func(t *testing.T) {
-		if _, err := httpgrpc.NewChannel(u, nil); err == nil {
+		if _, err := httpgrpc.NewChannelV2(u, nil); err == nil {
 			t.Fatal("expected an error for a nil transport")
 		}
 	})
 	t.Run("both supplied", func(t *testing.T) {
-		ch, err := httpgrpc.NewChannel(u, http.DefaultTransport, httpgrpc.WithJSONEncoding(true))
+		ch, err := httpgrpc.NewChannelV2(u, http.DefaultTransport, httpgrpc.WithJSONEncodingV2(true))
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}
@@ -263,17 +206,18 @@ func TestNewChannelValidation(t *testing.T) {
 	})
 }
 
-// TestChannelMissingFields covers the checks that cannot be made by NewChannel: a
-// Channel may also be built as a struct literal, and its fields are exported, so
-// they can be missing or cleared after construction. Either way the RPC should
-// report the problem, where it used to panic dereferencing a nil base URL.
-func TestChannelMissingFields(t *testing.T) {
+// TestChannelV2MissingFields covers the checks that cannot be made by
+// NewChannelV2: a ChannelV2 may also be built as a struct literal, and its fields
+// are exported, so they can be missing or cleared after construction. Either way
+// the RPC should report the problem, where it used to panic dereferencing a nil
+// base URL.
+func TestChannelV2MissingFields(t *testing.T) {
 	u, err := url.Parse("http://127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("failed to parse base URL: %v", err)
 	}
 
-	checkFails := func(t *testing.T, ch *httpgrpc.Channel) {
+	checkFails := func(t *testing.T, ch *httpgrpc.ChannelV2) {
 		t.Helper()
 		cli := grpchantesting.NewTestServiceClient(ch)
 		if _, err := cli.Unary(context.Background(), &grpchantesting.Message{}); err == nil {
@@ -285,53 +229,31 @@ func TestChannelMissingFields(t *testing.T) {
 	}
 
 	t.Run("struct literal without base URL", func(t *testing.T) {
-		checkFails(t, &httpgrpc.Channel{Transport: http.DefaultTransport})
+		checkFails(t, &httpgrpc.ChannelV2{Transport: http.DefaultTransport})
 	})
 	t.Run("struct literal without transport", func(t *testing.T) {
-		checkFails(t, &httpgrpc.Channel{BaseURL: u})
+		checkFails(t, &httpgrpc.ChannelV2{BaseURL: u})
 	})
-	t.Run("field cleared after NewChannel", func(t *testing.T) {
-		ch, err := httpgrpc.NewChannel(u, http.DefaultTransport)
-		if err != nil {
-			t.Fatalf("failed to create channel: %v", err)
-		}
+	t.Run("field cleared after NewChannelV2", func(t *testing.T) {
+		ch := newV2(t, u)
 		ch.BaseURL = nil
 		checkFails(t, ch)
 	})
 }
 
-// TestStreamSurvivesGC guards the finalizer that cancels an abandoned stream's
+// TestStreamSurvivesGCV2 guards the cleanup that cancels an abandoned stream's
 // context against cancelling one that is still being used.
 //
-// The finalizer is attached to the wrapper value handed back to the caller. If
+// The cleanup is attached to the wrapper value handed back to the caller. If
 // that wrapper's methods were promoted from an embedded interface, the wrapper
 // would fall out of reach as soon as a call descended into the stream underneath
 // it, since nothing on the stack refers to it any more. A garbage collection
-// during a blocking Recv would then run the finalizer and cancel an RPC that was
+// during a blocking Recv would then run the cleanup and cancel an RPC that was
 // still in progress, surfacing as a spurious "context canceled" in place of
 // whatever really ended the call. With collections forced, that reproduced on
 // every attempt.
-func TestStreamSurvivesGC(t *testing.T) {
-	svr := &grpchantesting.TestServer{}
-	reg := grpchan.HandlerMap{}
-	grpchantesting.RegisterTestServiceServer(reg, svr)
-
-	var mux http.ServeMux
-	httpgrpc.HandleServices(mux.HandleFunc, "/", reg, nil, nil)
-
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed it listen on socket: %v", err)
-	}
-	httpServer := http.Server{Handler: &mux}
-	go httpServer.Serve(l)
-	defer httpServer.Close()
-
-	u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", l.Addr().(*net.TCPAddr).Port))
-	if err != nil {
-		t.Fatalf("failed to parse base URL: %v", err)
-	}
-	cc := httpgrpc.Channel{Transport: http.DefaultTransport, BaseURL: u}
+func TestStreamSurvivesGCV2(t *testing.T) {
+	cc := httpgrpc.ChannelV2{Transport: http.DefaultTransport, BaseURL: v2ServerURL(t)}
 	cli := grpchantesting.NewTestServiceClient(&cc)
 
 	for i := 0; i < 5; i++ {
@@ -366,13 +288,13 @@ func TestStreamSurvivesGC(t *testing.T) {
 	}
 }
 
-// roundTripWatcher reports when a round trip ends.
-type roundTripWatcher struct {
+// roundTripWatcherV2 reports when a round trip ends.
+type roundTripWatcherV2 struct {
 	inner http.RoundTripper
 	ended chan error
 }
 
-func (t *roundTripWatcher) RoundTrip(r *http.Request) (*http.Response, error) {
+func (t *roundTripWatcherV2) RoundTrip(r *http.Request) (*http.Response, error) {
 	resp, err := t.inner.RoundTrip(r)
 	select {
 	case t.ended <- err:
@@ -381,7 +303,7 @@ func (t *roundTripWatcher) RoundTrip(r *http.Request) (*http.Response, error) {
 	return resp, err
 }
 
-// TestAbandonedStreamIsCleanedUp covers what the cleanup on clientStreamWrapper
+// TestAbandonedStreamIsCleanedUpV2 covers what the cleanup on the stream wrapper
 // is for: a caller that stops using a stream without finishing or cancelling it
 // should not leave the RPC running.
 //
@@ -389,27 +311,16 @@ func (t *roundTripWatcher) RoundTrip(r *http.Request) (*http.Response, error) {
 // a different question with a different answer: net/http does not watch a
 // connection for a disconnect while a request body remains unread, so a handler
 // finds out by way of a failed read rather than a cancelled context.
-func TestAbandonedStreamIsCleanedUp(t *testing.T) {
+func TestAbandonedStreamIsCleanedUpV2(t *testing.T) {
 	// A server that never answers, so the round trip stays pending until the
 	// client itself gives up.
 	block := make(chan struct{})
 	defer close(block)
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed it listen on socket: %v", err)
-	}
-	httpServer := http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	u := serveV2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-block
-	})}
-	go httpServer.Serve(l)
-	defer httpServer.Close()
-
-	u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", l.Addr().(*net.TCPAddr).Port))
-	if err != nil {
-		t.Fatalf("failed to parse base URL: %v", err)
-	}
-	transport := &roundTripWatcher{inner: http.DefaultTransport, ended: make(chan error, 1)}
-	cc := httpgrpc.Channel{Transport: transport, BaseURL: u}
+	}))
+	transport := &roundTripWatcherV2{inner: http.DefaultTransport, ended: make(chan error, 1)}
+	cc := httpgrpc.ChannelV2{Transport: transport, BaseURL: u}
 
 	// Open a stream and send on it, then abandon it: no CloseSend, no cancel. It
 	// is created on a goroutine that then exits, so no stack frame keeps the
@@ -441,5 +352,149 @@ func TestAbandonedStreamIsCleanedUp(t *testing.T) {
 		}
 	}
 	t.Fatal("the abandoned stream's round trip never ended, so its goroutine and " +
-		"connection are still held")
+		"connection would leak")
+}
+
+// TestChannelV2ResponseValidation covers the two ways a unary response can fail to
+// match what was asked for. Neither can be produced by a real grpchan server, so
+// the responses are hand-rolled.
+func TestChannelV2ResponseValidation(t *testing.T) {
+	respondWith := func(t *testing.T, contentType string) error {
+		u := serveV2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", contentType)
+			w.WriteHeader(http.StatusOK)
+		}))
+		cli := grpchantesting.NewTestServiceClient(newV2(t, u))
+		_, err := cli.Unary(context.Background(), &grpchantesting.Message{})
+		return err
+	}
+
+	t.Run("unknown content-type", func(t *testing.T) {
+		// Nothing can be decoded from a format the protocol does not know, so this
+		// is not an internal failure so much as an unintelligible reply.
+		err := respondWith(t, "application/x-bogus")
+		if got := status.Code(err); got != codes.Unknown {
+			t.Fatalf("expected Unknown, got %v (err=%v)", got, err)
+		}
+	})
+	t.Run("codec mismatch", func(t *testing.T) {
+		// A recognized format, but not the one the request used.
+		err := respondWith(t, "application/json")
+		if got := status.Code(err); got != codes.Internal {
+			t.Fatalf("expected Internal, got %v (err=%v)", got, err)
+		}
+	})
+}
+
+// TestServerV2ErrorsUseProtocolFormat checks that once a protocol has been
+// recognized from the content-type, failures are reported in that protocol's
+// error format rather than as bare HTTP errors. For httpgrpc that means an
+// X-GRPC-Status header carrying the real code, which a bare http.Error would not
+// have: the client would otherwise be left inferring a code from the HTTP status.
+func TestServerV2ErrorsUseProtocolFormat(t *testing.T) {
+	base := v2ServerURL(t)
+
+	send := func(t *testing.T, method, rpc, contentType string, hdrs map[string]string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(method, base.String()+"/grpchantesting.TestService/"+rpc, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", contentType)
+		for k, v := range hdrs {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("round trip failed: %v", err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+
+	// The status is reported as "<code>:<message>", so the code is the part before
+	// the first colon. codes.Unimplemented is 12, codes.InvalidArgument is 3.
+	wantCode := func(t *testing.T, resp *http.Response, want codes.Code) {
+		t.Helper()
+		got := resp.Header.Get("X-GRPC-Status")
+		if got == "" {
+			t.Fatalf("no X-GRPC-Status header: the error did not go through the protocol adapter (HTTP %s)", resp.Status)
+		}
+		if prefix := fmt.Sprintf("%d:", want); len(got) < len(prefix) || got[:len(prefix)] != prefix {
+			t.Fatalf("X-GRPC-Status = %q, want code %v (%d)", got, want, want)
+		}
+	}
+
+	t.Run("unary wrong method", func(t *testing.T) {
+		resp := send(t, "GET", "Unary", "application/x-protobuf", nil)
+		wantCode(t, resp, codes.Unimplemented)
+		if allow := resp.Header.Get("Allow"); allow != "POST" {
+			t.Errorf("Allow = %q, want POST", allow)
+		}
+	})
+	t.Run("unary undecodable metadata", func(t *testing.T) {
+		// A "-bin" header must be base64; one that is not makes the adapter's
+		// processHeaders fail, which is the reachable way to fail that step.
+		// (A malformed GRPC-Timeout is not: timeoutFromHeaders ignores one it
+		// cannot parse rather than rejecting the request.)
+		resp := send(t, "POST", "Unary", "application/x-protobuf",
+			map[string]string{"X-Test-Bin": "!!! not base64 !!!"})
+		wantCode(t, resp, codes.InvalidArgument)
+	})
+	t.Run("stream wrong method", func(t *testing.T) {
+		resp := send(t, "GET", "ServerStream", "application/x-httpgrpc-proto+v1", nil)
+		if ct := resp.Header.Get("Content-Type"); ct != "application/x-httpgrpc-proto+v1" {
+			t.Errorf("Content-Type = %q, want the stream content-type: the adapter should "+
+				"have labelled the response before writing the trailer frame", ct)
+		}
+	})
+
+	// A content-type no protocol claims has no error format to use, so it stays a
+	// bare HTTP error.
+	t.Run("unknown content-type falls back to HTTP", func(t *testing.T) {
+		resp := send(t, "POST", "Unary", "application/x-nonsense", nil)
+		if resp.StatusCode != http.StatusUnsupportedMediaType {
+			t.Errorf("status = %v, want 415", resp.Status)
+		}
+		if got := resp.Header.Get("X-GRPC-Status"); got != "" {
+			t.Errorf("X-GRPC-Status = %q, want none for an unrecognized content-type", got)
+		}
+	})
+}
+
+// serveV2 starts an http.Handler on a loopback port and returns its base URL.
+func serveV2(t *testing.T, h http.Handler) *url.URL {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on socket: %v", err)
+	}
+	svr := http.Server{Handler: h}
+	go svr.Serve(l)
+	t.Cleanup(func() { svr.Close() })
+
+	u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", l.Addr().(*net.TCPAddr).Port))
+	if err != nil {
+		t.Fatalf("failed to parse base URL: %v", err)
+	}
+	return u
+}
+
+// v2ServerURL exposes the test service using the ServerV2 implementation.
+func v2ServerURL(t *testing.T) *url.URL {
+	t.Helper()
+	svr := httpgrpc.NewServerV2()
+	grpchantesting.RegisterTestServiceServer(svr, &grpchantesting.TestServer{})
+	return serveV2(t, svr)
+}
+
+// newV2 builds a channel, failing the test rather than making every case handle a
+// constructor error it does not care about.
+func newV2(t *testing.T, u *url.URL, opts ...httpgrpc.ChannelV2Option) *httpgrpc.ChannelV2 {
+	t.Helper()
+	ch, err := httpgrpc.NewChannelV2(u, http.DefaultTransport, opts...)
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+	return ch
 }

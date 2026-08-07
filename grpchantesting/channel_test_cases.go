@@ -119,11 +119,16 @@ func testUnary(t *testing.T, cli TestServiceClient) {
 	})
 
 	t.Run("failure", func(t *testing.T) {
+		var hdr, tlr metadata.MD
 		req := proto.Clone(&reqPrototype).(*Message)
 		req.Code = int32(codes.AlreadyExists)
 		req.ErrorDetails = testErrorDetails
-		_, err := cli.Unary(ctx, req)
+		_, err := cli.Unary(ctx, req, grpc.Header(&hdr), grpc.Trailer(&tlr))
 		checkError(t, err, codes.AlreadyExists, testErrorMessages...)
+
+		// A failed call still reports its metadata.
+		checkMetadata(t, testMdHeaders, hdr, "header")
+		checkMetadata(t, testMdTrailers, tlr, "trailer")
 	})
 
 	t.Run("timeout", func(t *testing.T) {
