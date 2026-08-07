@@ -1,6 +1,7 @@
 package httpgrpc_test
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -582,6 +584,218 @@ func TestChannelMessageSizeLimits(t *testing.T) {
 			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
 		}
 	})
+}
+
+// TestServerMessageSizeLimits covers the server-side limits. Unlike the client,
+// the server takes them from options rather than per-call, so a server with no
+// options must keep behaving as it did before the options existed.
+func TestServerMessageSizeLimits(t *testing.T) {
+	// HandlerOption satisfies ServerOption, so the limit options can be given
+	// directly to NewServer.
+	newClient := func(t *testing.T, opts ...httpgrpc.ServerOption) grpchantesting.TestServiceClient {
+		t.Helper()
+		svr := httpgrpc.NewServer(opts...)
+		grpchantesting.RegisterTestServiceServer(svr, &grpchantesting.TestServer{})
+		ch, err := httpgrpc.NewChannel(serveHandler(t, svr), http.DefaultTransport)
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+		return grpchantesting.NewTestServiceClient(ch)
+	}
+	ctx := context.Background()
+	msg := &grpchantesting.Message{Payload: make([]byte, 1024)}
+
+	t.Run("defaults allow a real payload", func(t *testing.T) {
+		if _, err := newClient(t).Unary(ctx, msg); err != nil {
+			t.Fatalf("unary with a 1kb payload failed: %v", err)
+		}
+	})
+	t.Run("unary recv limit enforced", func(t *testing.T) {
+		_, err := newClient(t, httpgrpc.WithMaxRecvMsgSize(10)).Unary(ctx, msg)
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+	})
+	t.Run("unary send limit enforced", func(t *testing.T) {
+		// The service echoes the payload, so a small send limit fails the response
+		// rather than the request.
+		_, err := newClient(t, httpgrpc.WithMaxSendMsgSize(10)).Unary(ctx, msg)
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+	})
+	t.Run("stream recv limit enforced", func(t *testing.T) {
+		str, err := newClient(t, httpgrpc.WithMaxRecvMsgSize(10)).ClientStream(ctx)
+		if err != nil {
+			t.Fatalf("failed to initiate client stream: %v", err)
+		}
+		// The send itself may succeed, since the server only reports the refusal
+		// once it has read the message; the result of the call is what matters.
+		_ = str.Send(msg)
+		_, err = str.CloseAndRecv()
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+	})
+	t.Run("stream send limit enforced", func(t *testing.T) {
+		req := &grpchantesting.Message{Payload: make([]byte, 1024), Count: 1}
+		str, err := newClient(t, httpgrpc.WithMaxSendMsgSize(10)).ServerStream(ctx, req)
+		if err != nil {
+			t.Fatalf("failed to initiate server stream: %v", err)
+		}
+		_, err = str.Recv()
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+	})
+	t.Run("recv limit rejects before reading the body", func(t *testing.T) {
+		// As on the client, a declared length means an over-large request can be
+		// refused without reading it. The request is written by hand because that is
+		// the only way to declare a length and then send nothing: an HTTP client will
+		// not knowingly send a request whose body is shorter than it claims. A server
+		// that waits for the body it was promised gets no answer, so this hangs until
+		// the deadline rather than passing by accident.
+		svr := httpgrpc.NewServer(httpgrpc.WithMaxRecvMsgSize(10))
+		grpchantesting.RegisterTestServiceServer(svr, &grpchantesting.TestServer{})
+		base := serveHandler(t, svr)
+
+		conn, err := net.Dial("tcp", base.Host)
+		if err != nil {
+			t.Fatalf("failed to connect: %v", err)
+		}
+		defer conn.Close()
+		if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err = io.WriteString(conn, "POST /grpchantesting.TestService/Unary HTTP/1.1\r\n"+
+			"Host: "+base.Host+"\r\n"+
+			"Content-Type: "+httpgrpc.UnaryRpcContentType_V1+"\r\n"+
+			"Content-Length: 1048576\r\n"+
+			"\r\n")
+		if err != nil {
+			t.Fatalf("failed to write request: %v", err)
+		}
+
+		resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "POST"})
+		if err != nil {
+			t.Fatalf("failed to read response: %v", err)
+		}
+		defer resp.Body.Close()
+
+		// codes.ResourceExhausted is 8.
+		if got := resp.Header.Get("X-GRPC-Status"); !strings.HasPrefix(got, "8:") {
+			t.Fatalf("X-GRPC-Status = %q, want a ResourceExhausted status", got)
+		}
+	})
+	t.Run("refusal outlives a handler that ignores it", func(t *testing.T) {
+		// The handler here does what a careless one does: it discards the error and
+		// returns as if all were well. Since net/http offers no way to abort a
+		// response from outside the handler, the only defense is that the refusal
+		// sticks -- every later operation fails the same way, and the recorded status
+		// is what the caller is told, not the handler's rosier account.
+		for _, name := range []string{"Recv", "Send"} {
+			t.Run(name, func(t *testing.T) {
+				svr := httpgrpc.NewServer(
+					httpgrpc.WithMaxRecvMsgSize(10), httpgrpc.WithMaxSendMsgSize(10))
+				svr.RegisterService(&swallowingServiceDesc, struct{}{})
+				ch, err := httpgrpc.NewChannel(serveHandler(t, svr), http.DefaultTransport)
+				if err != nil {
+					t.Fatalf("failed to create channel: %v", err)
+				}
+
+				desc := &grpc.StreamDesc{StreamName: name, ClientStreams: true, ServerStreams: true}
+				str, err := ch.NewStream(ctx, desc, "/"+swallowingServiceDesc.ServiceName+"/"+name)
+				if err != nil {
+					t.Fatalf("failed to initiate stream: %v", err)
+				}
+				_ = str.SendMsg(msg)
+				_ = str.CloseSend()
+				err = str.RecvMsg(&grpchantesting.Message{})
+				if got := status.Code(err); got != codes.ResourceExhausted {
+					t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+				}
+			})
+		}
+	})
+	t.Run("refusal reaches the caller before the handler returns", func(t *testing.T) {
+		// The status is written where the stream ends, not where the handler returns.
+		// This handler never returns until the test lets it, so a status that arrives
+		// before then can only have come from the refusal itself.
+		release := make(chan struct{})
+		t.Cleanup(func() { close(release) })
+		blockingServiceDesc := grpc.ServiceDesc{
+			ServiceName: "grpchantesting.BlockingService",
+			HandlerType: (*interface{})(nil),
+			Streams: []grpc.StreamDesc{
+				{
+					StreamName:    "Recv",
+					ClientStreams: true,
+					ServerStreams: true,
+					Handler: func(_ interface{}, stream grpc.ServerStream) error {
+						_ = stream.RecvMsg(&grpchantesting.Message{})
+						<-release
+						return nil
+					},
+				},
+			},
+		}
+
+		svr := httpgrpc.NewServer(httpgrpc.WithMaxRecvMsgSize(10))
+		svr.RegisterService(&blockingServiceDesc, struct{}{})
+		ch, err := httpgrpc.NewChannel(serveHandler(t, svr), http.DefaultTransport)
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+
+		desc := &grpc.StreamDesc{StreamName: "Recv", ClientStreams: true, ServerStreams: true}
+		str, err := ch.NewStream(ctx, desc, "/"+blockingServiceDesc.ServiceName+"/Recv")
+		if err != nil {
+			t.Fatalf("failed to initiate stream: %v", err)
+		}
+		_ = str.SendMsg(msg)
+
+		recvd := make(chan error, 1)
+		go func() { recvd <- str.RecvMsg(&grpchantesting.Message{}) }()
+		select {
+		case err := <-recvd:
+			if got := status.Code(err); got != codes.ResourceExhausted {
+				t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("status did not arrive while the handler was still running")
+		}
+	})
+}
+
+// swallowingServiceDesc is a service whose handlers ignore the errors they are
+// given, so that a test can tell what the transport reports on its own.
+//
+// Recv refuses the request message and Send refuses the response, which are the
+// two ways a limit ends a stream; both then return nil, claiming success.
+var swallowingServiceDesc = grpc.ServiceDesc{
+	ServiceName: "grpchantesting.SwallowingService",
+	HandlerType: (*interface{})(nil),
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Recv",
+			ClientStreams: true,
+			ServerStreams: true,
+			Handler: func(_ interface{}, stream grpc.ServerStream) error {
+				_ = stream.RecvMsg(&grpchantesting.Message{})
+				return nil
+			},
+		},
+		{
+			StreamName:    "Send",
+			ClientStreams: true,
+			ServerStreams: true,
+			Handler: func(_ interface{}, stream grpc.ServerStream) error {
+				_ = stream.SendMsg(&grpchantesting.Message{Payload: make([]byte, 1024)})
+				return nil
+			},
+		},
+	},
 }
 
 // serveHandler starts an http.Handler on a loopback port and returns its base URL.
