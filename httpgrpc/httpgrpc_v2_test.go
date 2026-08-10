@@ -59,9 +59,10 @@ func TestGRPCOverHTTPV2(t *testing.T) {
 	})
 
 	// The cases above pass against either implementation, since the two are wire
-	// compatible. This one does not: a rejected HTTP method is reported in the
-	// protocol's own error format, where the older handlers answer with a bare 405.
-	// It is what pins these handlers to the protocol adapter.
+	// compatible (that is what TestV1V2Compatibility asserts). This one does not:
+	// a rejected HTTP method is reported in the protocol's own error format, where
+	// the older handlers answer with a bare 405. It is what pins these handlers to
+	// the protocol adapter.
 	t.Run("wrong method", func(t *testing.T) {
 		u := *cc.BaseURL
 		u.Path = path.Join(u.Path, "grpchantesting.TestService/Unary")
@@ -355,6 +356,33 @@ func TestAbandonedStreamIsCleanedUpV2(t *testing.T) {
 		"connection would leak")
 }
 
+// TestV1V2Compatibility is the reason the V2 implementations were written
+// alongside the originals instead of replacing them: it pins down that either
+// client interoperates with either server, so the two can eventually be collapsed
+// without breaking deployments that upgrade one side at a time.
+func TestV1V2Compatibility(t *testing.T) {
+	t.Run("v1client_v2server", func(t *testing.T) {
+		t.Run("proto", func(t *testing.T) {
+			ch := newV1(t, v2ServerURL(t))
+			grpchantesting.RunChannelTestCases(t, ch, supportsFullDuplex)
+		})
+		t.Run("json", func(t *testing.T) {
+			ch := newV1(t, v2ServerURL(t), httpgrpc.WithJSONEncoding(true))
+			grpchantesting.RunChannelTestCases(t, ch, supportsFullDuplex)
+		})
+	})
+	t.Run("v2client_v1server", func(t *testing.T) {
+		t.Run("proto", func(t *testing.T) {
+			ch := newV2(t, v1ServerURL(t))
+			grpchantesting.RunChannelTestCases(t, ch, supportsFullDuplex)
+		})
+		t.Run("json", func(t *testing.T) {
+			ch := newV2(t, v1ServerURL(t), httpgrpc.WithJSONEncodingV2(true))
+			grpchantesting.RunChannelTestCases(t, ch, supportsFullDuplex)
+		})
+	})
+}
+
 // TestChannelV2ResponseValidation covers the two ways a unary response can fail to
 // match what was asked for. Neither can be produced by a real grpchan server, so
 // the responses are hand-rolled.
@@ -480,6 +508,16 @@ func serveV2(t *testing.T, h http.Handler) *url.URL {
 	return u
 }
 
+// v1ServerURL exposes the test service using the Server implementation.
+func v1ServerURL(t *testing.T) *url.URL {
+	t.Helper()
+	reg := grpchan.HandlerMap{}
+	grpchantesting.RegisterTestServiceServer(reg, &grpchantesting.TestServer{})
+	var mux http.ServeMux
+	httpgrpc.HandleServices(mux.HandleFunc, "/", reg, nil, nil)
+	return serveV2(t, &mux)
+}
+
 // v2ServerURL exposes the test service using the ServerV2 implementation.
 func v2ServerURL(t *testing.T) *url.URL {
 	t.Helper()
@@ -488,8 +526,17 @@ func v2ServerURL(t *testing.T) *url.URL {
 	return serveV2(t, svr)
 }
 
-// newV2 builds a channel, failing the test rather than making every case handle a
-// constructor error it does not care about.
+// newV1 and newV2 build a channel of each kind, failing the test rather than
+// making every case handle a constructor error it does not care about.
+func newV1(t *testing.T, u *url.URL, opts ...httpgrpc.ChannelOption) *httpgrpc.Channel {
+	t.Helper()
+	ch, err := httpgrpc.NewChannel(u, http.DefaultTransport, opts...)
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+	return ch
+}
+
 func newV2(t *testing.T, u *url.URL, opts ...httpgrpc.ChannelV2Option) *httpgrpc.ChannelV2 {
 	t.Helper()
 	ch, err := httpgrpc.NewChannelV2(u, http.DefaultTransport, opts...)
