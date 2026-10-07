@@ -27,17 +27,17 @@ import (
 // HTTP 1.1, so every case below runs the suite with supportsFullDuplex false.
 const supportsFullDuplex = false
 
-func TestGRPCOverHTTPV2(t *testing.T) {
+func TestGRPCOverHTTP(t *testing.T) {
 	reg := grpchan.HandlerMap{}
 	grpchantesting.RegisterTestServiceServer(reg, &grpchantesting.TestServer{})
 
 	var mux http.ServeMux
-	httpgrpc.HandleServicesV2(mux.HandleFunc, "/", reg, nil, nil)
+	httpgrpc.HandleServices(mux.HandleFunc, "/", reg, nil, nil)
 
 	// now setup client stub
-	cc := httpgrpc.ChannelV2{
+	cc := httpgrpc.Channel{
 		Transport: http.DefaultTransport,
-		BaseURL:   serveV2(t, &mux),
+		BaseURL:   serveHandler(t, &mux),
 	}
 
 	grpchantesting.RunChannelTestCases(t, &cc, supportsFullDuplex)
@@ -58,11 +58,9 @@ func TestGRPCOverHTTPV2(t *testing.T) {
 		}
 	})
 
-	// The cases above pass against either implementation, since the two are wire
-	// compatible (that is what TestV1V2Compatibility asserts). This one does not:
-	// a rejected HTTP method is reported in the protocol's own error format, where
-	// the older handlers answer with a bare 405. It is what pins these handlers to
-	// the protocol adapter.
+	// A rejected HTTP method is reported in the protocol's own error format,
+	// rather than as a bare 405, which is what pins these handlers to the protocol
+	// adapter.
 	t.Run("wrong method", func(t *testing.T) {
 		u := *cc.BaseURL
 		u.Path = path.Join(u.Path, "grpchantesting.TestService/Unary")
@@ -88,14 +86,14 @@ func TestGRPCOverHTTPV2(t *testing.T) {
 	})
 }
 
-// This test is nearly identical to TestGrpcOverHttpV2, except that it uses
-// *httpgrpc.ServerV2 instead of httpgrpc.HandleServicesV2. It also exercises
+// This test is nearly identical to TestGRPCOverHTTP, except that it uses
+// *httpgrpc.Server instead of httpgrpc.HandleServices. It also exercises
 // both sub-formats; the JSON case covers the server-sent-events framing used
 // for JSON streams.
-func TestServerV2(t *testing.T) {
-	run := func(t *testing.T, opts ...httpgrpc.ChannelV2Option) {
+func TestServer(t *testing.T) {
+	run := func(t *testing.T, opts ...httpgrpc.ChannelOption) {
 		t.Helper()
-		cc := newV2(t, v2ServerURL(t), opts...)
+		cc := newChannel(t, serverURL(t), opts...)
 
 		grpchantesting.RunChannelTestCases(t, cc, supportsFullDuplex)
 
@@ -120,14 +118,56 @@ func TestServerV2(t *testing.T) {
 		run(t)
 	})
 	t.Run("json", func(t *testing.T) {
-		run(t, httpgrpc.WithJSONEncodingV2(true))
+		run(t, httpgrpc.WithJSONEncoding(true))
 	})
 }
 
-// TestUnaryXGrpcDetailsWireCodecV2 asserts that X-GRPC-Details header payloads use
+func TestServerBasePath(t *testing.T) {
+	svc := &grpchantesting.TestServer{}
+	svr := httpgrpc.NewServer(httpgrpc.WithBasePath("/foo/"))
+	grpchantesting.RegisterTestServiceServer(svr, svc)
+
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on socket: %v", err)
+	}
+	httpServer := http.Server{Handler: svr}
+	go httpServer.Serve(l)
+	defer httpServer.Close()
+
+	// now setup client stub
+	u, err := url.Parse(fmt.Sprintf("http://127.0.0.1:%d/foo/", l.Addr().(*net.TCPAddr).Port))
+	if err != nil {
+		t.Fatalf("failed to parse base URL: %v", err)
+	}
+	cc, err := httpgrpc.NewChannel(u, http.DefaultTransport, httpgrpc.WithJSONEncoding(true))
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+
+	grpchantesting.RunChannelTestCases(t, cc, false)
+
+	t.Run("empty-trailer", func(t *testing.T) {
+		// test RPC w/ streaming response where trailer message is empty
+		// (e.g. no trailer metadata and code == 0 [OK])
+		cli := grpchantesting.NewTestServiceClient(cc)
+		str, err := cli.ServerStream(context.Background(), &grpchantesting.Message{})
+		if err != nil {
+			t.Fatalf("failed to initiate server stream: %v", err)
+		}
+		// if there is an issue with trailer message, it will appear to be
+		// a regular message and err would be nil
+		_, err = str.Recv()
+		if err != io.EOF {
+			t.Fatalf("server stream should not have returned any messages")
+		}
+	})
+}
+
+// TestUnaryXGRPCDetailsWireCodec asserts that X-GRPC-Details header payloads use
 // the same encoding as the unary request body (protobuf vs JSON), so the
 // client recovers google.rpc.Status details correctly for both modes.
-func TestUnaryXGRPCDetailsWireCodecV2(t *testing.T) {
+func TestUnaryXGRPCDetailsWireCodec(t *testing.T) {
 	detailMsg := &structpb.ListValue{
 		Values: []*structpb.Value{
 			{Kind: &structpb.Value_StringValue{StringValue: "x-grpc-details-wire"}},
@@ -138,7 +178,7 @@ func TestUnaryXGRPCDetailsWireCodecV2(t *testing.T) {
 		t.Fatalf("marshal detail any: %v", err)
 	}
 
-	u := v2ServerURL(t)
+	u := serverURL(t)
 
 	mkReq := func() *grpchantesting.Message {
 		return &grpchantesting.Message{
@@ -148,21 +188,21 @@ func TestUnaryXGRPCDetailsWireCodecV2(t *testing.T) {
 	}
 
 	t.Run("protobuf", func(t *testing.T) {
-		cc := &httpgrpc.ChannelV2{Transport: http.DefaultTransport, BaseURL: u}
+		cc := &httpgrpc.Channel{Transport: http.DefaultTransport, BaseURL: u}
 		cli := grpchantesting.NewTestServiceClient(cc)
 		_, err := cli.Unary(context.Background(), mkReq())
-		assertUnaryErrorHasDetailV2(t, err, codes.FailedPrecondition, detailMsg)
+		assertUnaryErrorHasDetail(t, err, codes.FailedPrecondition, detailMsg)
 	})
 
 	t.Run("json", func(t *testing.T) {
-		cc := newV2(t, u, httpgrpc.WithJSONEncodingV2(true))
+		cc := newChannel(t, u, httpgrpc.WithJSONEncoding(true))
 		cli := grpchantesting.NewTestServiceClient(cc)
 		_, err := cli.Unary(context.Background(), mkReq())
-		assertUnaryErrorHasDetailV2(t, err, codes.FailedPrecondition, detailMsg)
+		assertUnaryErrorHasDetail(t, err, codes.FailedPrecondition, detailMsg)
 	})
 }
 
-func assertUnaryErrorHasDetailV2(t *testing.T, err error, wantCode codes.Code, wantDetail proto.Message) {
+func assertUnaryErrorHasDetail(t *testing.T, err error, wantCode codes.Code, wantDetail proto.Message) {
 	t.Helper()
 	st, ok := status.FromError(err)
 	if !ok {
@@ -180,24 +220,24 @@ func assertUnaryErrorHasDetailV2(t *testing.T, err error, wantCode codes.Code, w
 	}
 }
 
-func TestNewChannelV2Validation(t *testing.T) {
+func TestNewChannelValidation(t *testing.T) {
 	u, err := url.Parse("http://127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("failed to parse base URL: %v", err)
 	}
 
 	t.Run("base URL is required", func(t *testing.T) {
-		if _, err := httpgrpc.NewChannelV2(nil, http.DefaultTransport); err == nil {
+		if _, err := httpgrpc.NewChannel(nil, http.DefaultTransport); err == nil {
 			t.Fatal("expected an error for a nil base URL")
 		}
 	})
 	t.Run("transport is required", func(t *testing.T) {
-		if _, err := httpgrpc.NewChannelV2(u, nil); err == nil {
+		if _, err := httpgrpc.NewChannel(u, nil); err == nil {
 			t.Fatal("expected an error for a nil transport")
 		}
 	})
 	t.Run("both supplied", func(t *testing.T) {
-		ch, err := httpgrpc.NewChannelV2(u, http.DefaultTransport, httpgrpc.WithJSONEncodingV2(true))
+		ch, err := httpgrpc.NewChannel(u, http.DefaultTransport, httpgrpc.WithJSONEncoding(true))
 		if err != nil {
 			t.Fatalf("failed to create channel: %v", err)
 		}
@@ -207,18 +247,18 @@ func TestNewChannelV2Validation(t *testing.T) {
 	})
 }
 
-// TestChannelV2MissingFields covers the checks that cannot be made by
-// NewChannelV2: a ChannelV2 may also be built as a struct literal, and its fields
+// TestChannelMissingFields covers the checks that cannot be made by
+// NewChannel: a Channel may also be built as a struct literal, and its fields
 // are exported, so they can be missing or cleared after construction. Either way
 // the RPC should report the problem, where it used to panic dereferencing a nil
 // base URL.
-func TestChannelV2MissingFields(t *testing.T) {
+func TestChannelMissingFields(t *testing.T) {
 	u, err := url.Parse("http://127.0.0.1:1")
 	if err != nil {
 		t.Fatalf("failed to parse base URL: %v", err)
 	}
 
-	checkFails := func(t *testing.T, ch *httpgrpc.ChannelV2) {
+	checkFails := func(t *testing.T, ch *httpgrpc.Channel) {
 		t.Helper()
 		cli := grpchantesting.NewTestServiceClient(ch)
 		if _, err := cli.Unary(context.Background(), &grpchantesting.Message{}); err == nil {
@@ -230,19 +270,19 @@ func TestChannelV2MissingFields(t *testing.T) {
 	}
 
 	t.Run("struct literal without base URL", func(t *testing.T) {
-		checkFails(t, &httpgrpc.ChannelV2{Transport: http.DefaultTransport})
+		checkFails(t, &httpgrpc.Channel{Transport: http.DefaultTransport})
 	})
 	t.Run("struct literal without transport", func(t *testing.T) {
-		checkFails(t, &httpgrpc.ChannelV2{BaseURL: u})
+		checkFails(t, &httpgrpc.Channel{BaseURL: u})
 	})
-	t.Run("field cleared after NewChannelV2", func(t *testing.T) {
-		ch := newV2(t, u)
+	t.Run("field cleared after NewChannel", func(t *testing.T) {
+		ch := newChannel(t, u)
 		ch.BaseURL = nil
 		checkFails(t, ch)
 	})
 }
 
-// TestStreamSurvivesGCV2 guards the cleanup that cancels an abandoned stream's
+// TestStreamSurvivesGC guards the cleanup that cancels an abandoned stream's
 // context against cancelling one that is still being used.
 //
 // The cleanup is attached to the wrapper value handed back to the caller. If
@@ -253,8 +293,8 @@ func TestChannelV2MissingFields(t *testing.T) {
 // still in progress, surfacing as a spurious "context canceled" in place of
 // whatever really ended the call. With collections forced, that reproduced on
 // every attempt.
-func TestStreamSurvivesGCV2(t *testing.T) {
-	cc := httpgrpc.ChannelV2{Transport: http.DefaultTransport, BaseURL: v2ServerURL(t)}
+func TestStreamSurvivesGC(t *testing.T) {
+	cc := httpgrpc.Channel{Transport: http.DefaultTransport, BaseURL: serverURL(t)}
 	cli := grpchantesting.NewTestServiceClient(&cc)
 
 	for i := 0; i < 5; i++ {
@@ -289,13 +329,13 @@ func TestStreamSurvivesGCV2(t *testing.T) {
 	}
 }
 
-// roundTripWatcherV2 reports when a round trip ends.
-type roundTripWatcherV2 struct {
+// roundTripWatcher reports when a round trip ends.
+type roundTripWatcher struct {
 	inner http.RoundTripper
 	ended chan error
 }
 
-func (t *roundTripWatcherV2) RoundTrip(r *http.Request) (*http.Response, error) {
+func (t *roundTripWatcher) RoundTrip(r *http.Request) (*http.Response, error) {
 	resp, err := t.inner.RoundTrip(r)
 	select {
 	case t.ended <- err:
@@ -304,7 +344,7 @@ func (t *roundTripWatcherV2) RoundTrip(r *http.Request) (*http.Response, error) 
 	return resp, err
 }
 
-// TestAbandonedStreamIsCleanedUpV2 covers what the cleanup on the stream wrapper
+// TestAbandonedStreamIsCleanedUp covers what the cleanup on the stream wrapper
 // is for: a caller that stops using a stream without finishing or cancelling it
 // should not leave the RPC running.
 //
@@ -312,16 +352,16 @@ func (t *roundTripWatcherV2) RoundTrip(r *http.Request) (*http.Response, error) 
 // a different question with a different answer: net/http does not watch a
 // connection for a disconnect while a request body remains unread, so a handler
 // finds out by way of a failed read rather than a cancelled context.
-func TestAbandonedStreamIsCleanedUpV2(t *testing.T) {
+func TestAbandonedStreamIsCleanedUp(t *testing.T) {
 	// A server that never answers, so the round trip stays pending until the
 	// client itself gives up.
 	block := make(chan struct{})
 	defer close(block)
-	u := serveV2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	u := serveHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-block
 	}))
-	transport := &roundTripWatcherV2{inner: http.DefaultTransport, ended: make(chan error, 1)}
-	cc := httpgrpc.ChannelV2{Transport: transport, BaseURL: u}
+	transport := &roundTripWatcher{inner: http.DefaultTransport, ended: make(chan error, 1)}
+	cc := httpgrpc.Channel{Transport: transport, BaseURL: u}
 
 	// Open a stream and send on it, then abandon it: no CloseSend, no cancel. It
 	// is created on a goroutine that then exits, so no stack frame keeps the
@@ -356,43 +396,16 @@ func TestAbandonedStreamIsCleanedUpV2(t *testing.T) {
 		"connection would leak")
 }
 
-// TestV1V2Compatibility is the reason the V2 implementations were written
-// alongside the originals instead of replacing them: it pins down that either
-// client interoperates with either server, so the two can eventually be collapsed
-// without breaking deployments that upgrade one side at a time.
-func TestV1V2Compatibility(t *testing.T) {
-	t.Run("v1client_v2server", func(t *testing.T) {
-		t.Run("proto", func(t *testing.T) {
-			ch := newV1(t, v2ServerURL(t))
-			grpchantesting.RunChannelTestCases(t, ch, supportsFullDuplex)
-		})
-		t.Run("json", func(t *testing.T) {
-			ch := newV1(t, v2ServerURL(t), httpgrpc.WithJSONEncoding(true))
-			grpchantesting.RunChannelTestCases(t, ch, supportsFullDuplex)
-		})
-	})
-	t.Run("v2client_v1server", func(t *testing.T) {
-		t.Run("proto", func(t *testing.T) {
-			ch := newV2(t, v1ServerURL(t))
-			grpchantesting.RunChannelTestCases(t, ch, supportsFullDuplex)
-		})
-		t.Run("json", func(t *testing.T) {
-			ch := newV2(t, v1ServerURL(t), httpgrpc.WithJSONEncodingV2(true))
-			grpchantesting.RunChannelTestCases(t, ch, supportsFullDuplex)
-		})
-	})
-}
-
-// TestChannelV2ResponseValidation covers the two ways a unary response can fail to
+// TestChannelResponseValidation covers the two ways a unary response can fail to
 // match what was asked for. Neither can be produced by a real grpchan server, so
 // the responses are hand-rolled.
-func TestChannelV2ResponseValidation(t *testing.T) {
+func TestChannelResponseValidation(t *testing.T) {
 	respondWith := func(t *testing.T, contentType string) error {
-		u := serveV2(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u := serveHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", contentType)
 			w.WriteHeader(http.StatusOK)
 		}))
-		cli := grpchantesting.NewTestServiceClient(newV2(t, u))
+		cli := grpchantesting.NewTestServiceClient(newChannel(t, u))
 		_, err := cli.Unary(context.Background(), &grpchantesting.Message{})
 		return err
 	}
@@ -414,13 +427,13 @@ func TestChannelV2ResponseValidation(t *testing.T) {
 	})
 }
 
-// TestServerV2ErrorsUseProtocolFormat checks that once a protocol has been
+// TestServerErrorsUseProtocolFormat checks that once a protocol has been
 // recognized from the content-type, failures are reported in that protocol's
 // error format rather than as bare HTTP errors. For httpgrpc that means an
 // X-GRPC-Status header carrying the real code, which a bare http.Error would not
 // have: the client would otherwise be left inferring a code from the HTTP status.
-func TestServerV2ErrorsUseProtocolFormat(t *testing.T) {
-	base := v2ServerURL(t)
+func TestServerErrorsUseProtocolFormat(t *testing.T) {
+	base := serverURL(t)
 
 	send := func(t *testing.T, method, rpc, contentType string, hdrs map[string]string) *http.Response {
 		t.Helper()
@@ -490,8 +503,8 @@ func TestServerV2ErrorsUseProtocolFormat(t *testing.T) {
 	})
 }
 
-// serveV2 starts an http.Handler on a loopback port and returns its base URL.
-func serveV2(t *testing.T, h http.Handler) *url.URL {
+// serveHandler starts an http.Handler on a loopback port and returns its base URL.
+func serveHandler(t *testing.T, h http.Handler) *url.URL {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -508,38 +521,19 @@ func serveV2(t *testing.T, h http.Handler) *url.URL {
 	return u
 }
 
-// v1ServerURL exposes the test service using the Server implementation.
-func v1ServerURL(t *testing.T) *url.URL {
+// serverURL exposes the test service using the Server implementation.
+func serverURL(t *testing.T) *url.URL {
 	t.Helper()
-	reg := grpchan.HandlerMap{}
-	grpchantesting.RegisterTestServiceServer(reg, &grpchantesting.TestServer{})
-	var mux http.ServeMux
-	httpgrpc.HandleServices(mux.HandleFunc, "/", reg, nil, nil)
-	return serveV2(t, &mux)
-}
-
-// v2ServerURL exposes the test service using the ServerV2 implementation.
-func v2ServerURL(t *testing.T) *url.URL {
-	t.Helper()
-	svr := httpgrpc.NewServerV2()
+	svr := httpgrpc.NewServer()
 	grpchantesting.RegisterTestServiceServer(svr, &grpchantesting.TestServer{})
-	return serveV2(t, svr)
+	return serveHandler(t, svr)
 }
 
-// newV1 and newV2 build a channel of each kind, failing the test rather than
-// making every case handle a constructor error it does not care about.
-func newV1(t *testing.T, u *url.URL, opts ...httpgrpc.ChannelOption) *httpgrpc.Channel {
+// newChannel builds a channel, failing the test rather than making every case
+// handle a constructor error it does not care about.
+func newChannel(t *testing.T, u *url.URL, opts ...httpgrpc.ChannelOption) *httpgrpc.Channel {
 	t.Helper()
 	ch, err := httpgrpc.NewChannel(u, http.DefaultTransport, opts...)
-	if err != nil {
-		t.Fatalf("failed to create channel: %v", err)
-	}
-	return ch
-}
-
-func newV2(t *testing.T, u *url.URL, opts ...httpgrpc.ChannelV2Option) *httpgrpc.ChannelV2 {
-	t.Helper()
-	ch, err := httpgrpc.NewChannelV2(u, http.DefaultTransport, opts...)
 	if err != nil {
 		t.Fatalf("failed to create channel: %v", err)
 	}
