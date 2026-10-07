@@ -3,64 +3,18 @@ package httpgrpc
 import (
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"strings"
 
-	"github.com/fullstorydev/grpchan/internal/sse"
-	"google.golang.org/grpc/mem"
-
-	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/metadata"
 )
 
 const (
 	maxMessageSize = 100 * 1024 * 1024 // 100mb
 )
-
-// writeSizePreface writes the given 32-bit size to the given writer.
-func writeSizePreface(w io.Writer, sz int32) error {
-	return binary.Write(w, binary.BigEndian, sz)
-}
-
-// writeProtoMessage writes a length-delimited proto message to the given
-// writer. This writes the size preface, indicating the size of the encoded
-// message, followed by the actual message contents. If end is true, the
-// size is written as a negative value, indicating to the receiver that this
-// is the last message in the stream. (The last message should be an instance
-// of HttpTrailer.)
-func writeProtoMessage(w io.Writer, codec encoding.CodecV2, m interface{}, end bool) error {
-	buf, err := codec.Marshal(m)
-	if err != nil {
-		return err
-	}
-	b := buf.Materialize()
-
-	sz := len(b)
-	if sz > math.MaxInt32 {
-		return fmt.Errorf("message too large to send: %d bytes", sz)
-	}
-	if end {
-		// trailer message is indicated w/ negative size
-		sz = -sz
-	}
-	err = writeSizePreface(w, int32(sz))
-	if err != nil {
-		return err
-	}
-
-	_, err = w.Write(b)
-	if err == nil {
-		if f, ok := w.(http.Flusher); ok {
-			f.Flush()
-		}
-	}
-	return err
-}
 
 // readSizePreface reads a 32-bit size from the given reader. If the value is
 // negative, it indicates the last message in the stream. Messages can have zero
@@ -151,134 +105,3 @@ func (a strAddr) Network() string {
 }
 
 func (a strAddr) String() string { return string(a) }
-
-type streamReader func() (streamMsg, error)
-
-type streamWriter func(m any, isTrailer bool) error
-
-type flusher interface {
-	Flush() error
-}
-
-type streamMsg struct {
-	codec     encoding.CodecV2
-	data      []byte
-	isTrailer bool
-}
-
-func (s *streamMsg) Decode(m any) error {
-	return s.codec.Unmarshal(mem.BufferSlice{mem.SliceBuffer(s.data)}, m)
-}
-
-func newSizePrefixedReader(r io.Reader, codec encoding.CodecV2) func() (streamMsg, error) {
-	return func() (streamMsg, error) {
-		size, err := readSizePreface(r)
-		if err != nil {
-			return streamMsg{}, err
-		}
-
-		isTrailer := size < 0
-		if isTrailer {
-			size = -size
-		}
-
-		if size > maxMessageSize {
-			return streamMsg{}, fmt.Errorf("bad size preface: indicated size is too large: %d", size)
-		}
-
-		data := make([]byte, size)
-		_, err = io.ReadAtLeast(r, data, int(size))
-		if errors.Is(err, io.EOF) { // io.EOF is returned if no bytes were read
-			return streamMsg{}, io.ErrUnexpectedEOF
-		} else if err != nil {
-			return streamMsg{}, err
-		}
-
-		return streamMsg{
-			codec:     codec,
-			data:      data,
-			isTrailer: isTrailer,
-		}, nil
-	}
-}
-
-func newSizePrefixedWriter(w io.Writer, codec encoding.CodecV2) func(m any, isTrailer bool) error {
-	return func(m any, isTrailer bool) error {
-		return writeProtoMessage(w, codec, m, isTrailer)
-	}
-}
-
-func newJSONReader(r io.Reader, codec encoding.CodecV2) func() (streamMsg, error) {
-	d := json.NewDecoder(r)
-	return func() (streamMsg, error) {
-		var msg json.RawMessage
-		if err := d.Decode(&msg); err != nil {
-			return streamMsg{}, err
-		}
-
-		return streamMsg{
-			codec: codec,
-			data:  msg,
-		}, nil
-	}
-}
-
-func newJSONWriter(w io.Writer, codec encoding.CodecV2) func(m any, isTrailer bool) error {
-	return func(m any, isTrailer bool) error {
-		if isTrailer {
-			panic("trailers are not supported for JSON")
-		}
-
-		data, err := codec.Marshal(m)
-		if err != nil {
-			return err
-		}
-
-		_, err = w.Write(data.Materialize())
-		return err
-	}
-}
-
-func newSSEWriter(w io.Writer, flusher flusher, codec encoding.CodecV2) func(m any, isTrailer bool) error {
-	e := sse.NewEncoder(w)
-	return func(m any, isTrailer bool) error {
-		data, err := codec.Marshal(m)
-		if err != nil {
-			return err
-		}
-
-		if isTrailer {
-			if err := e.Encode(&sse.Event{
-				Type: "trailer",
-				Data: data.Materialize(),
-			}); err != nil {
-				return err
-			}
-		} else {
-			if err := e.Encode(&sse.Event{
-				Data: data.Materialize(),
-			}); err != nil {
-				return err
-			}
-		}
-
-		return flusher.Flush()
-	}
-}
-
-func newSSEReader(r io.Reader, codec encoding.CodecV2) func() (streamMsg, error) {
-	d := sse.NewDecoder(r)
-
-	return func() (streamMsg, error) {
-		event, err := d.Decode()
-		if err != nil {
-			return streamMsg{}, err
-		}
-
-		return streamMsg{
-			codec:     codec,
-			data:      event.Data,
-			isTrailer: event.Type == "trailer",
-		}, nil
-	}
-}

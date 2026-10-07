@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"path"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
@@ -24,19 +26,69 @@ import (
 	"github.com/fullstorydev/grpchan/internal"
 )
 
-// ServerV2 is a gRPC-over-HTTP server. It acts as a grpc.ServiceRegistrar,
+// Server is a gRPC-over-HTTP server. It acts as a grpc.ServiceRegistrar,
 // for registering server implementations, and also implements http.Handler,
 // for exposing the services via HTTP.
-type ServerV2 Server
+type Server struct {
+	mux       http.ServeMux
+	handlers  grpchan.HandlerMap
+	basePath  string
+	unaryInt  grpc.UnaryServerInterceptor
+	streamInt grpc.StreamServerInterceptor
+	opts      handlerOpts
+}
 
-// NewServerV2 returns a new gRPC-over-HTTP server. The given options (which can
+var (
+	_ http.Handler          = (*Server)(nil)
+	_ grpc.ServiceRegistrar = (*Server)(nil)
+)
+
+// ServerOption is an option used when constructing a NewServer.
+type ServerOption interface {
+	apply(*Server)
+}
+
+type serverOptFunc func(*Server)
+
+func (fn serverOptFunc) apply(s *Server) {
+	fn(s)
+}
+
+// WithBasePath configured the gRPC-over-HTTP server to use the given base path.
+// The default base path is "/". If the caller mounts the *httpgrpc.Server at
+// some sub-path, this can be used to inform the handler of that path. As an
+// alternative, the caller could instead use http.StripPrefix so that the
+// *httpgrpc.Server does not need to know the sub-path.
+func WithBasePath(path string) ServerOption {
+	return serverOptFunc(func(s *Server) {
+		s.basePath = path
+	})
+}
+
+// WithServerUnaryInterceptor configures the gRPC-over-HTTP server to use the given
+// server interceptor for unary RPCs when dispatching.
+func WithServerUnaryInterceptor(interceptor grpc.UnaryServerInterceptor) ServerOption {
+	return serverOptFunc(func(s *Server) {
+		s.unaryInt = interceptor
+	})
+}
+
+// WithServerStreamInterceptor configures the gRP-over-HTTP server to use the
+// given server interceptor for streaming RPCs when dispatching.
+func WithServerStreamInterceptor(interceptor grpc.StreamServerInterceptor) ServerOption {
+	return serverOptFunc(func(s *Server) {
+		s.streamInt = interceptor
+	})
+}
+
+// NewServer returns a new gRPC-over-HTTP server. The given options (which can
 // include instances of HandlerOption) can be used to customize the server behavior.
-func NewServerV2(opts ...ServerOption) *ServerV2 {
-	var s ServerV2
+func NewServer(opts ...ServerOption) *Server {
+	var s Server
 	s.basePath = "/"
 	s.handlers = grpchan.HandlerMap{}
 	for _, o := range opts {
-		o.apply((*Server)(&s))
+		o.apply(&s)
 	}
 	return &s
 }
@@ -45,16 +97,16 @@ func NewServerV2(opts ...ServerOption) *ServerV2 {
 // gRPC server, a gRPC-over-HTTP server only allows a single implementation for a
 // particular service. Services are identified by their fully-qualified name
 // (e.g. "<package>.<service>").
-func (s *ServerV2) RegisterService(desc *grpc.ServiceDesc, svr interface{}) {
+func (s *Server) RegisterService(desc *grpc.ServiceDesc, svr interface{}) {
 	s.handlers.RegisterService(desc, svr)
 	for i := range desc.Methods {
 		md := desc.Methods[i]
-		h := handleMethodV2(svr, desc.ServiceName, &md, s.unaryInt, &s.opts)
+		h := handleMethod(svr, desc.ServiceName, &md, s.unaryInt, &s.opts)
 		s.mux.HandleFunc(path.Join(s.basePath, fmt.Sprintf("%s/%s", desc.ServiceName, md.MethodName)), h)
 	}
 	for i := range desc.Streams {
 		sd := desc.Streams[i]
-		h := handleStreamV2(svr, desc.ServiceName, &sd, s.streamInt, &s.opts)
+		h := handleStream(svr, desc.ServiceName, &sd, s.streamInt, &s.opts)
 		s.mux.HandleFunc(path.Join(s.basePath, fmt.Sprintf("%s/%s", desc.ServiceName, sd.StreamName)), h)
 	}
 }
@@ -62,22 +114,107 @@ func (s *ServerV2) RegisterService(desc *grpc.ServiceDesc, svr interface{}) {
 // GetServiceInfo returns information about the registered services. This allows
 // the channel to implement the reflection.GRPCServer interface (so that a
 // gRPC-over-HTTP channel be the source of descriptors for server reflection).
-func (s *ServerV2) GetServiceInfo() map[string]grpc.ServiceInfo {
+func (s *Server) GetServiceInfo() map[string]grpc.ServiceInfo {
 	return s.handlers.GetServiceInfo()
 }
 
 // ServeHTTP implements http.Handler, allowing the server to be attached to an
 // *http.Server, to actually expose the registered servers to HTTP clients.
-func (s *ServerV2) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-// HandleServicesV2 uses the given mux to register handlers for all methods
+// Mux is a function that can register a gRPC-over-HTTP handler. This is used to
+// register handlers in bulk for an RPC service. Its signature matches that of
+// the HandleFunc method of the http.ServeMux type, and it also matches that of
+// the http.HandleFunc function (for registering handlers with the default mux).
+//
+// Callers can provide custom Mux functions that further decorate the handler
+// (for example, adding authentication checks, logging, error handling, etc).
+type Mux func(pattern string, handler func(http.ResponseWriter, *http.Request))
+
+// HandlerOption is an option to customize some aspect of the HTTP handler
+// behavior, such as rendering gRPC errors to HTTP responses.
+//
+// HandlerOptions also implement ServerOption.
+type HandlerOption func(*handlerOpts)
+
+func (ho HandlerOption) apply(s *Server) {
+	ho(&s.opts)
+}
+
+type handlerOpts struct {
+	errFunc func(context.Context, *status.Status, http.ResponseWriter)
+}
+
+// ErrorRenderer returns a HandlerOption that will cause the handler to use the
+// given function to render an error.  It is only used for unary RPCs since
+// streaming RPCs serialize a status message to the response trailer (in the
+// HTTP body) instead.
+//
+// The function should call methods on response in order to write an error
+// response, including any response headers, the HTTP status code, and any
+// response body.
+//
+// If no such option is used, the handler will use DefaultErrorRenderer.
+func ErrorRenderer(errFunc func(reqCtx context.Context, st *status.Status, response http.ResponseWriter)) HandlerOption {
+	return func(h *handlerOpts) {
+		h.errFunc = errFunc
+	}
+}
+
+// DefaultErrorRenderer translates the gRPC code in the given status to an HTTP
+// error response. The following table shows how status codes are translated:
+//
+//	Canceled:         * 502 Bad Gateway
+//	Unknown:            500 Internal Server Error
+//	InvalidArgument:    400 Bad Request
+//	DeadlineExceeded: * 504 Gateway Timeout
+//	NotFound:           404 Not Found
+//	AlreadyExists:      409 Conflict
+//	PermissionDenied:   403 Forbidden
+//	Unauthenticated:    401 Unauthorized
+//	ResourceExhausted:  429 Too Many Requests
+//	FailedPrecondition: 412 Precondition Failed
+//	Aborted:            409 Conflict
+//	OutOfRange:         422 Unprocessable Entity
+//	Unimplemented:      501 Not Implemented
+//	Internal:           500 Internal Server Error
+//	Unavailable:        503 Service Unavailable
+//	DataLoss:           500 Internal Server Error
+//
+//	* If the gRPC status indicates Canceled or DeadlineExceeded
+//	  and the given request context ALSO indicates a context error
+//	  (meaning that the request was cancelled by the client), then
+//	  a 499 Client Closed Request code is used instead.
+//
+// If any other gRPC status code is observed, it would get translated into a
+// 500 Internal Server Error.
+//
+// Note that OK is absent from the mapping because the error renderer will never
+// be called for a non-error status.
+//
+// This function uses http.Error to render the computed code (and corresponding
+// status text) to the given ResponseWriter.
+func DefaultErrorRenderer(ctx context.Context, st *status.Status, w http.ResponseWriter) {
+	if (st.Code() == codes.Canceled || st.Code() == codes.DeadlineExceeded) && ctx.Err() != nil {
+		http.Error(w, "Client Closed Request", 499)
+		return
+	}
+	code := httpStatusFromCode(st.Code())
+	msg := http.StatusText(code)
+	if msg == "" {
+		msg = st.Code().String()
+	}
+	http.Error(w, msg, code)
+}
+
+// HandleServices uses the given mux to register handlers for all methods
 // exposed by handlers registered in reg. They are registered using a path of
 // "basePath/name.of.Service/Method". If non-nil interceptor(s) are provided
 // then they will be used to intercept applicable RPCs before dispatch to the
 // registered handler.
-func HandleServicesV2(mux Mux, basePath string, reg grpchan.HandlerMap, unaryInt grpc.UnaryServerInterceptor, streamInt grpc.StreamServerInterceptor, opts ...HandlerOption) {
+func HandleServices(mux Mux, basePath string, reg grpchan.HandlerMap, unaryInt grpc.UnaryServerInterceptor, streamInt grpc.StreamServerInterceptor, opts ...HandlerOption) {
 	var hOpts handlerOpts
 	for _, opt := range opts {
 		opt(&hOpts)
@@ -86,28 +223,28 @@ func HandleServicesV2(mux Mux, basePath string, reg grpchan.HandlerMap, unaryInt
 	reg.ForEach(func(desc *grpc.ServiceDesc, svr interface{}) {
 		for i := range desc.Methods {
 			md := desc.Methods[i]
-			h := handleMethodV2(svr, desc.ServiceName, &md, unaryInt, &hOpts)
+			h := handleMethod(svr, desc.ServiceName, &md, unaryInt, &hOpts)
 			mux(path.Join(basePath, fmt.Sprintf("%s/%s", desc.ServiceName, md.MethodName)), h)
 		}
 		for i := range desc.Streams {
 			sd := desc.Streams[i]
-			h := handleStreamV2(svr, desc.ServiceName, &sd, streamInt, &hOpts)
+			h := handleStream(svr, desc.ServiceName, &sd, streamInt, &hOpts)
 			mux(path.Join(basePath, fmt.Sprintf("%s/%s", desc.ServiceName, sd.StreamName)), h)
 		}
 	})
 }
 
-// HandleMethodV2 returns an HTTP handler that will handle a unary RPC method
+// HandleMethod returns an HTTP handler that will handle a unary RPC method
 // by dispatching the given method on the given server.
-func HandleMethodV2(svr interface{}, serviceName string, desc *grpc.MethodDesc, unaryInt grpc.UnaryServerInterceptor, opts ...HandlerOption) http.HandlerFunc {
+func HandleMethod(svr interface{}, serviceName string, desc *grpc.MethodDesc, unaryInt grpc.UnaryServerInterceptor, opts ...HandlerOption) http.HandlerFunc {
 	var hOpts handlerOpts
 	for _, opt := range opts {
 		opt(&hOpts)
 	}
-	return handleMethodV2(svr, serviceName, desc, unaryInt, &hOpts)
+	return handleMethod(svr, serviceName, desc, unaryInt, &hOpts)
 }
 
-func handleMethodV2(svr interface{}, serviceName string, desc *grpc.MethodDesc, unaryInt grpc.UnaryServerInterceptor, opts *handlerOpts) http.HandlerFunc {
+func handleMethod(svr interface{}, serviceName string, desc *grpc.MethodDesc, unaryInt grpc.UnaryServerInterceptor, opts *handlerOpts) http.HandlerFunc {
 	fullMethod := fmt.Sprintf("/%s/%s", serviceName, desc.MethodName)
 	return func(w http.ResponseWriter, r *http.Request) {
 		call, err := beginCall(w, r, opts, false)
@@ -162,17 +299,17 @@ func handleMethodV2(svr interface{}, serviceName string, desc *grpc.MethodDesc, 
 	}
 }
 
-// HandleStreamV2 returns an HTTP handler that will handle a streaming RPC method
+// HandleStream returns an HTTP handler that will handle a streaming RPC method
 // by dispatching the given method on the given server.
-func HandleStreamV2(svr interface{}, serviceName string, desc *grpc.StreamDesc, streamInt grpc.StreamServerInterceptor, opts ...HandlerOption) http.HandlerFunc {
+func HandleStream(svr interface{}, serviceName string, desc *grpc.StreamDesc, streamInt grpc.StreamServerInterceptor, opts ...HandlerOption) http.HandlerFunc {
 	var hOpts handlerOpts
 	for _, opt := range opts {
 		opt(&hOpts)
 	}
-	return handleStreamV2(svr, serviceName, desc, streamInt, &hOpts)
+	return handleStream(svr, serviceName, desc, streamInt, &hOpts)
 }
 
-func handleStreamV2(svr interface{}, serviceName string, desc *grpc.StreamDesc, streamInt grpc.StreamServerInterceptor, opts *handlerOpts) http.HandlerFunc {
+func handleStream(svr interface{}, serviceName string, desc *grpc.StreamDesc, streamInt grpc.StreamServerInterceptor, opts *handlerOpts) http.HandlerFunc {
 	info := &grpc.StreamServerInfo{
 		FullMethod:     fmt.Sprintf("/%s/%s", serviceName, desc.StreamName),
 		IsClientStream: desc.ClientStreams,
@@ -192,7 +329,7 @@ func handleStreamV2(svr interface{}, serviceName string, desc *grpc.StreamDesc, 
 			return
 		}
 
-		str := &serverStreamV2{
+		str := &serverStream{
 			protocol:  call.protocol,
 			codec:     call.codec,
 			w:         w,
@@ -287,11 +424,54 @@ func errorStatus(err error) *status.Status {
 	return st
 }
 
-// serverStreamV2 implements grpc.ServerStream on top of a serverProtocolAdapter.
-// Unlike serverStream, it holds no knowledge of how messages are framed or how a
-// stream is terminated: it encodes and decodes messages with a codec, and defers
-// framing to the adapter, so that each protocol can frame differently.
-type serverStreamV2 struct {
+func peerFromRequest(r *http.Request) *peer.Peer {
+	pr := peer.Peer{Addr: strAddr(r.RemoteAddr)}
+	if r.TLS != nil {
+		pr.AuthInfo = credentials.TLSInfo{State: *r.TLS}
+	}
+	return &pr
+}
+
+func drainAndClose(r io.ReadCloser) error {
+	_, copyErr := io.Copy(ioutil.Discard, r)
+	closeErr := r.Close()
+	// error from io.Copy likely more useful than the one from Close
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+func writeError(w http.ResponseWriter, code int) {
+	msg := http.StatusText(code)
+	if msg == "" {
+		if code == 499 {
+			msg = "Client Closed Request"
+		} else {
+			msg = "Unknown"
+		}
+	}
+	http.Error(w, msg, code)
+}
+
+// asTrailerProto converts the given metadata into a map that can be used with
+// HttpTrailer to convey trailers back to the caller via a final message in the
+// response body.
+func asTrailerProto(md metadata.MD) map[string]*TrailerValues {
+	result := map[string]*TrailerValues{}
+	for k, vs := range md {
+		tvs := TrailerValues{}
+		tvs.Values = append(tvs.Values, vs...)
+		result[k] = &tvs
+	}
+	return result
+}
+
+// serverStream implements grpc.ServerStream on top of a serverProtocolAdapter. It
+// holds no knowledge of how messages are framed or how a stream is terminated: it
+// encodes and decodes messages with a codec, and defers framing to the adapter, so
+// that each protocol can frame differently.
+type serverStream struct {
 	ctx      context.Context
 	protocol serverProtocolAdapter
 	codec    encoding.CodecV2
@@ -313,11 +493,11 @@ type serverStreamV2 struct {
 	tr          []metadata.MD
 }
 
-var _ grpc.ServerStream = (*serverStreamV2)(nil)
+var _ grpc.ServerStream = (*serverStream)(nil)
 
 // finish ends the stream once the handler has returned, writing the terminating
 // message that reports err as its outcome.
-func (s *serverStreamV2) finish(err error) {
+func (s *serverStream) finish(err error) {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 
@@ -326,7 +506,7 @@ func (s *serverStreamV2) finish(err error) {
 
 // writeTrailerLocked writes the final frame of the response, which carries the
 // status of the RPC and any trailer metadata. The caller must hold wmu.
-func (s *serverStreamV2) writeTrailerLocked(err error) {
+func (s *serverStream) writeTrailerLocked(err error) {
 	if s.writeFailed {
 		// A stream whose last write failed is in no state to report anything.
 		return
@@ -342,15 +522,15 @@ func (s *serverStreamV2) writeTrailerLocked(err error) {
 	s.protocol.finishStream(errorStatus(err), metadata.Join(s.tr...))
 }
 
-func (s *serverStreamV2) SetHeader(md metadata.MD) error {
+func (s *serverStream) SetHeader(md metadata.MD) error {
 	return s.setHeader(md, false)
 }
 
-func (s *serverStreamV2) SendHeader(md metadata.MD) error {
+func (s *serverStream) SendHeader(md metadata.MD) error {
 	return s.setHeader(md, true)
 }
 
-func (s *serverStreamV2) setHeader(md metadata.MD, send bool) error {
+func (s *serverStream) setHeader(md metadata.MD, send bool) error {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 
@@ -370,18 +550,18 @@ func (s *serverStreamV2) setHeader(md metadata.MD, send bool) error {
 	return nil
 }
 
-func (s *serverStreamV2) SetTrailer(md metadata.MD) {
+func (s *serverStream) SetTrailer(md metadata.MD) {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 
 	s.tr = append(s.tr, md)
 }
 
-func (s *serverStreamV2) Context() context.Context {
+func (s *serverStream) Context() context.Context {
 	return s.ctx
 }
 
-func (s *serverStreamV2) SendMsg(m interface{}) error {
+func (s *serverStream) SendMsg(m interface{}) error {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 
@@ -400,7 +580,7 @@ func (s *serverStreamV2) SendMsg(m interface{}) error {
 	return err
 }
 
-func (s *serverStreamV2) RecvMsg(m interface{}) error {
+func (s *serverStream) RecvMsg(m interface{}) error {
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
 
@@ -427,7 +607,7 @@ func (s *serverStreamV2) RecvMsg(m interface{}) error {
 // sendHeadersLocked hands the accumulated header metadata to the adapter, which
 // labels the response body and commits the status line. Once this has run, no
 // further header may be set. It is a no-op if the headers are already sent.
-func (s *serverStreamV2) sendHeadersLocked() {
+func (s *serverStream) sendHeadersLocked() {
 	if s.headersSent {
 		return
 	}
@@ -435,7 +615,7 @@ func (s *serverStreamV2) sendHeadersLocked() {
 	s.protocol.sendStreamHeaders(metadata.Join(s.hd...))
 }
 
-func (s *serverStreamV2) sendMsgLocked(m interface{}) error {
+func (s *serverStream) sendMsgLocked(m interface{}) error {
 	buf, err := s.codec.Marshal(m)
 	if err != nil {
 		return err
@@ -455,7 +635,7 @@ func (s *serverStreamV2) sendMsgLocked(m interface{}) error {
 	return nil
 }
 
-func (s *serverStreamV2) recvMsgLocked(m interface{}) error {
+func (s *serverStream) recvMsgLocked(m interface{}) error {
 	data, err := s.protocol.readStreamRequest()
 	if err != nil {
 		return err

@@ -2,28 +2,40 @@ package httpgrpc
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/base64"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"path"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
+	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/encoding"
 	grpcproto "google.golang.org/grpc/encoding/proto"
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	anypb "google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/fullstorydev/grpchan/internal"
 )
 
-// ChannelV2Option is a function that can be used to configure a ChannelV2.
-type ChannelV2Option func(*channelV2Options) error
+// ChannelOption is a function that can be used to configure a Channel.
+type ChannelOption func(*channelOptions) error
 
-type channelV2Options struct {
+type channelOptions struct {
 	// codecName is the name the codec was looked up by. It selects the content type
 	// of a request and, with the grpc-over-http protocol defined in this package,
 	// also how streams are framed.
@@ -39,7 +51,7 @@ type channelV2Options struct {
 	newProtocol clientProtocolAdapterFactory
 }
 
-func (o *channelV2Options) setCodec(name string) error {
+func (o *channelOptions) setCodec(name string) error {
 	codec, err := codecByName(name)
 	if err != nil {
 		return err
@@ -48,38 +60,48 @@ func (o *channelV2Options) setCodec(name string) error {
 	return nil
 }
 
-func defaultChannelV2Options() (channelV2Options, error) {
-	var opts channelV2Options
+func defaultChannelOptions() (channelOptions, error) {
+	var opts channelOptions
 	// Default to protobuf binary encoding.
 	if err := opts.setCodec(grpcproto.Name); err != nil {
-		return channelV2Options{}, err
+		return channelOptions{}, err
 	}
 	return opts, nil
 }
 
-// WithJSONEncodingV2 configures the channel to use JSON encoding between the client and server.
+// codecByName looks up a registered codec, reporting an unrecognized name as
+// an error.
+func codecByName(name string) (encoding.CodecV2, error) {
+	codec := encoding.GetCodecV2(name)
+	if codec == nil {
+		return nil, fmt.Errorf("no codec registered for %q", name)
+	}
+	return codec, nil
+}
+
+// WithJSONEncoding configures the channel to use JSON encoding between the client and server.
 // For unary calls, the request and response are JSON values. For streaming calls, the request is
 // a series of JSON values and the response is SSE events containing JSON values.
-func WithJSONEncodingV2(useJSONEncoding bool) ChannelV2Option {
-	return func(o *channelV2Options) error {
+func WithJSONEncoding(useJSONEncoding bool) ChannelOption {
+	return func(o *channelOptions) error {
 		name := grpcproto.Name
 		if useJSONEncoding {
 			name = jsonCodecName
 		}
-		// Resolved in both directions, so that a later WithJSONEncodingV2(false) undoes
-		// an earlier WithJSONEncodingV2(true) rather than leaving JSON in place.
+		// Resolved in both directions, so that a later WithJSONEncoding(false) undoes
+		// an earlier WithJSONEncoding(true) rather than leaving JSON in place.
 		return o.setCodec(name)
 	}
 }
 
-// NewChannelV2 creates a new ChannelV2 with the given base URL and transport, both of
-// which are required. The ChannelV2Option functions can be used to configure the
-// ChannelV2. The error reports a channel that cannot be configured as asked.
-func NewChannelV2(baseURL *url.URL, transport http.RoundTripper, opts ...ChannelV2Option) (*ChannelV2, error) {
+// NewChannel creates a new Channel with the given base URL and transport, both of
+// which are required. The ChannelOption functions can be used to configure the
+// Channel. The error reports a channel that cannot be configured as asked.
+func NewChannel(baseURL *url.URL, transport http.RoundTripper, opts ...ChannelOption) (*Channel, error) {
 	if err := checkChannelParams(baseURL, transport); err != nil {
 		return nil, err
 	}
-	chOpts, err := defaultChannelV2Options()
+	chOpts, err := defaultChannelOptions()
 	if err != nil {
 		return nil, err
 	}
@@ -88,39 +110,51 @@ func NewChannelV2(baseURL *url.URL, transport http.RoundTripper, opts ...Channel
 			return nil, err
 		}
 	}
-	return &ChannelV2{
+	return &Channel{
 		BaseURL:   baseURL,
 		Transport: transport,
 		opts:      &chOpts,
 	}, nil
 }
 
-// ChannelV2 is used as a connection for GRPC requests issued over HTTP 1.1.
-// Values should be created using the NewChannelV2 constructor.
+func checkChannelParams(baseURL *url.URL, transport http.RoundTripper) error {
+	if baseURL == nil {
+		return errors.New("channel base URL is required")
+	}
+	if transport == nil {
+		return errors.New("channel transport is required")
+	}
+	return nil
+}
+
+// Channel is used as a connection for GRPC requests issued over HTTP 1.1.
+// Values should be created using the NewChannel constructor.
 //
 // For backwards compatibility, it is still allowed to construct the channel
 // via a struct literal, as long as both Transport and BaseURL fields are set
-// to non-nil values. Construction via struct literal produces a ChannelV2 with
-// all default behavior; use of NewChannelV2 is required to provide channel
+// to non-nil values. Construction via struct literal produces a Channel with
+// all default behavior; use of NewChannel is required to provide channel
 // options.
 //
-// It implements no one protocol: the wire format is supplied by a protocol
-// adapter, which defaults to the GRPC-over-HTTP transport protocol defined in
-// this package.
-type ChannelV2 struct {
+// The channel is not tied to a single wire format: framing is supplied by a
+// protocol adapter, which defaults to the GRPC-over-HTTP transport protocol
+// defined in this package.
+type Channel struct {
 	Transport http.RoundTripper
 	BaseURL   *url.URL
 	// opts is nil when the channel was built as a struct literal, which is the
 	// older and still supported form, and so carries all default behavior. A
-	// non-nil value means NewChannelV2 already validated the configuration.
-	opts *channelV2Options
+	// non-nil value means NewChannel already validated the configuration.
+	opts *channelOptions
 }
 
-var _ grpc.ClientConnInterface = (*ChannelV2)(nil)
+var _ grpc.ClientConnInterface = (*Channel)(nil)
+
+var grpcDetailsHeader = textproto.CanonicalMIMEHeaderKey("X-GRPC-Details")
 
 // Invoke satisfies the grpchan.Channel interface and supports sending unary
 // RPCs via the in-process channel.
-func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp interface{}, opts ...grpc.CallOption) error {
+func (ch *Channel) Invoke(ctx context.Context, methodName string, req, resp interface{}, opts ...grpc.CallOption) error {
 	chOpts, err := ch.channelOptions()
 	if err != nil {
 		return err
@@ -199,7 +233,7 @@ func (ch *ChannelV2) Invoke(ctx context.Context, methodName string, req, resp in
 
 // NewStream satisfies the grpchan.Channel interface and supports sending
 // streaming RPCs via the in-process channel.
-func (ch *ChannelV2) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodName string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+func (ch *Channel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodName string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
 	chOpts, err := ch.channelOptions()
 	if err != nil {
 		return nil, err
@@ -235,7 +269,7 @@ func (ch *ChannelV2) NewStream(ctx context.Context, desc *grpc.StreamDesc, metho
 	}
 	req.Header = h
 
-	cs := &clientStreamV2{
+	cs := &clientStream{
 		ctx:        ctx,
 		cancel:     cancel,
 		copts:      copts,
@@ -257,24 +291,93 @@ func (ch *ChannelV2) NewStream(ctx context.Context, desc *grpc.StreamDesc, metho
 	return ret, nil
 }
 
-func (ch *ChannelV2) channelOptions() (channelV2Options, error) {
+func (ch *Channel) channelOptions() (channelOptions, error) {
 	// These fields are exported and mutable, so we check them on every call.
 	err := checkChannelParams(ch.BaseURL, ch.Transport)
 	if err != nil {
-		return channelV2Options{}, err
+		return channelOptions{}, err
 	}
 	if ch.opts != nil {
-		// Configured and validated by NewChannelV2.
+		// Configured and validated by NewChannel.
 		return *ch.opts, nil
 	}
-	return defaultChannelV2Options()
+	return defaultChannelOptions()
 }
 
-// clientStreamV2 implements grpc.ClientStream on top of a clientProtocolAdapter.
+// clientStreamWrapper exists so that a stream the caller abandons still has its
+// context cancelled, by a runtime cleanup, rather than leaving the RPC open
+// forever.
+//
+// Its methods are spelled out rather than promoted from an embedded interface,
+// and each one keeps the wrapper alive across the call it delegates to. Promoted
+// methods would let the wrapper become unreachable as soon as a call descended
+// into the stream underneath it, since nothing on the stack refers to the wrapper
+// any more. A garbage collection during a blocking Recv could then run the
+// cleanup and cancel an RPC that was still very much in progress, surfacing as a
+// spurious "context canceled".
+type clientStreamWrapper struct {
+	stream grpc.ClientStream
+}
+
+var _ grpc.ClientStream = (*clientStreamWrapper)(nil)
+
+func (w *clientStreamWrapper) Header() (metadata.MD, error) {
+	md, err := w.stream.Header()
+	runtime.KeepAlive(w)
+	return md, err
+}
+
+func (w *clientStreamWrapper) Trailer() metadata.MD {
+	md := w.stream.Trailer()
+	runtime.KeepAlive(w)
+	return md
+}
+
+func (w *clientStreamWrapper) CloseSend() error {
+	err := w.stream.CloseSend()
+	runtime.KeepAlive(w)
+	return err
+}
+
+func (w *clientStreamWrapper) Context() context.Context {
+	ctx := w.stream.Context()
+	runtime.KeepAlive(w)
+	return ctx
+}
+
+func (w *clientStreamWrapper) SendMsg(m interface{}) error {
+	err := w.stream.SendMsg(m)
+	runtime.KeepAlive(w)
+	return err
+}
+
+func (w *clientStreamWrapper) RecvMsg(m interface{}) error {
+	err := w.stream.RecvMsg(m)
+	runtime.KeepAlive(w)
+	return err
+}
+
+func getPeer(baseUrl *url.URL, tls *tls.ConnectionState) *peer.Peer {
+	hostPort := baseUrl.Host
+	if !strings.Contains(hostPort, ":") {
+		if baseUrl.Scheme == "https" {
+			hostPort = hostPort + ":443"
+		} else if baseUrl.Scheme == "http" {
+			hostPort = hostPort + ":80"
+		}
+	}
+	pr := peer.Peer{Addr: strAddr(hostPort)}
+	if tls != nil {
+		pr.AuthInfo = credentials.TLSInfo{State: *tls}
+	}
+	return &pr
+}
+
+// clientStream implements grpc.ClientStream on top of a clientProtocolAdapter.
 // It knows neither how messages are framed nor how a stream conveys its final
 // status: both are left to the adapter, which is what lets one implementation
 // serve protocols that terminate streams differently.
-type clientStreamV2 struct {
+type clientStream struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	copts   *internal.CallOptions
@@ -307,14 +410,14 @@ type clientStreamV2 struct {
 	wErr error
 }
 
-var _ grpc.ClientStream = (*clientStreamV2)(nil)
+var _ grpc.ClientStream = (*clientStream)(nil)
 
-func (cs *clientStreamV2) Header() (metadata.MD, error) {
+func (cs *clientStream) Header() (metadata.MD, error) {
 	cs.ready.Wait()
 	return cs.hd, cs.hdErr
 }
 
-func (cs *clientStreamV2) Trailer() metadata.MD {
+func (cs *clientStream) Trailer() metadata.MD {
 	// only safe to read trailers after stream has completed
 	cs.rMu.RLock()
 	defer cs.rMu.RUnlock()
@@ -324,19 +427,27 @@ func (cs *clientStreamV2) Trailer() metadata.MD {
 	return nil
 }
 
-func (cs *clientStreamV2) CloseSend() error {
+func metadataFromProto(trailers map[string]*TrailerValues) metadata.MD {
+	md := metadata.MD{}
+	for k, vs := range trailers {
+		md[k] = vs.Values
+	}
+	return md
+}
+
+func (cs *clientStream) CloseSend() error {
 	cs.wMu.Lock()
 	defer cs.wMu.Unlock()
 	return cs.w.Close()
 }
 
-func (cs *clientStreamV2) Context() context.Context {
+func (cs *clientStream) Context() context.Context {
 	return cs.ctx
 }
 
 // readErrorIfDone reports whether the stream has finished and, if so, why: io.EOF
 // when it completed successfully, otherwise the RPC's failure status.
-func (cs *clientStreamV2) readErrorIfDone() (bool, error) {
+func (cs *clientStream) readErrorIfDone() (bool, error) {
 	cs.rMu.RLock()
 	defer cs.rMu.RUnlock()
 	if !cs.done {
@@ -345,7 +456,7 @@ func (cs *clientStreamV2) readErrorIfDone() (bool, error) {
 	return true, cs.rErr
 }
 
-func (cs *clientStreamV2) SendMsg(m interface{}) error {
+func (cs *clientStream) SendMsg(m interface{}) error {
 	// GRPC streams return EOF error for attempts to send on closed stream
 	if done, _ := cs.readErrorIfDone(); done {
 		return io.EOF
@@ -362,7 +473,7 @@ func (cs *clientStreamV2) SendMsg(m interface{}) error {
 	return cs.wErr
 }
 
-func (cs *clientStreamV2) RecvMsg(m interface{}) error {
+func (cs *clientStream) RecvMsg(m interface{}) error {
 	if done, err := cs.readErrorIfDone(); done {
 		return err
 	}
@@ -403,7 +514,7 @@ func (cs *clientStreamV2) RecvMsg(m interface{}) error {
 
 // doHttpCall performs the HTTP round trip and then reads the response body,
 // handing each message's encoded bytes to RecvMsg via rCh.
-func (cs *clientStreamV2) doHttpCall(transport http.RoundTripper, req *http.Request, readPipe *io.PipeReader) {
+func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Request, readPipe *io.PipeReader) {
 	// On completion we must record why the stream ended and then close the
 	// channel, which is what signals end-of-stream to client code.
 	var rErr error
@@ -524,14 +635,14 @@ func (cs *clientStreamV2) doHttpCall(transport http.RoundTripper, req *http.Requ
 
 // newAdapter creates the protocol adapter for a single RPC. Adapters are per-RPC
 // because deframing a response can be stateful; see clientProtocolAdapterFactory.
-func (o channelV2Options) newAdapter() (clientProtocolAdapter, error) {
+func (o channelOptions) newAdapter() (clientProtocolAdapter, error) {
 	if o.newProtocol != nil {
 		return o.newProtocol(o.codecName)
 	}
 	return newHTTPGRPCClientAdapter(o.codecName)
 }
 
-func (cs *clientStreamV2) sendMsgLocked(m interface{}) error {
+func (cs *clientStream) sendMsgLocked(m interface{}) error {
 	buf, err := cs.codec.Marshal(m)
 	if err != nil {
 		return err
@@ -545,7 +656,7 @@ func (cs *clientStreamV2) sendMsgLocked(m interface{}) error {
 }
 
 // errAfterClose reports why the stream ended, once rCh has been closed.
-func (cs *clientStreamV2) errAfterClose() error {
+func (cs *clientStream) errAfterClose() error {
 	done, err := cs.readErrorIfDone()
 	if !done {
 		// sanity check: this shouldn't be possible, since done is always set
@@ -555,7 +666,7 @@ func (cs *clientStreamV2) errAfterClose() error {
 	return err
 }
 
-func (cs *clientStreamV2) tooManyResponses() error {
+func (cs *clientStream) tooManyResponses() error {
 	cs.rMu.Lock()
 	defer cs.rMu.Unlock()
 	if cs.rErr == nil {
@@ -566,4 +677,78 @@ func (cs *clientStreamV2) tooManyResponses() error {
 		cs.cancel()
 	}
 	return cs.rErr
+}
+
+// statusFromContextError translates the given error, returned by a call to
+// context.Context.Err(), into a suitable GRPC error. If the given error is
+// not a context error (e.g. neither deadline exceeded nor canceled) then it
+// is returned as is.
+func statusFromContextError(err error) error {
+	if err == context.DeadlineExceeded {
+		return status.Error(codes.DeadlineExceeded, err.Error())
+	} else if err == context.Canceled {
+		return status.Error(codes.Canceled, err.Error())
+	}
+	return err
+}
+
+// headersFromContext returns HTTP request headers to send to the remote host
+// based on the specified context. GRPC clients store outgoing metadata into the
+// context, which is translated into headers. Also, a context deadline will be
+// propagated to the server via GRPC timeout metadata.
+func headersFromContext(ctx context.Context) http.Header {
+	h := http.Header{}
+	if md, ok := metadata.FromOutgoingContext(ctx); ok {
+		toHeaders(md, h, "")
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout := time.Until(deadline)
+		millis := int64(timeout / time.Millisecond)
+		if millis <= 0 {
+			millis = 1
+		}
+		h.Set("GRPC-Timeout", fmt.Sprintf("%dm", millis))
+	}
+	return h
+}
+
+func statFromResponse(reply *http.Response, detailsCodec encoding.CodecV2) *status.Status {
+	code := codeFromHttpStatus(reply.StatusCode)
+	msg := reply.Status
+	codeStrs := strings.SplitN(reply.Header.Get("X-GRPC-Status"), ":", 2)
+	if len(codeStrs) > 0 && codeStrs[0] != "" {
+		if c, err := strconv.ParseInt(codeStrs[0], 10, 32); err == nil {
+			code = codes.Code(c)
+		}
+		if len(codeStrs) > 1 {
+			msg = codeStrs[1]
+		}
+	}
+	if code != codes.OK {
+		var details []*anypb.Any
+		if detailHeaders := reply.Header[grpcDetailsHeader]; len(detailHeaders) > 0 {
+			details = make([]*anypb.Any, 0, len(detailHeaders))
+			for _, d := range detailHeaders {
+				b, err := base64.RawURLEncoding.DecodeString(d)
+				if err != nil {
+					continue
+				}
+				msg := new(anypb.Any)
+				if err := detailsCodec.Unmarshal(mem.BufferSlice{mem.SliceBuffer(b)}, msg); err != nil {
+					continue
+				}
+				details = append(details, msg)
+			}
+		}
+		if len(details) > 0 {
+			statProto := spb.Status{
+				Code:    int32(code),
+				Message: msg,
+				Details: details,
+			}
+			return status.FromProto(&statProto)
+		}
+		return status.New(code, msg)
+	}
+	return nil
 }
