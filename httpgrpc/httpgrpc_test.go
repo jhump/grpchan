@@ -2,6 +2,7 @@ package httpgrpc_test
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -427,6 +428,160 @@ func TestChannelResponseValidation(t *testing.T) {
 	})
 }
 
+// TestChannelMessageSizeLimits covers the MaxCallRecvMsgSize and MaxCallSendMsgSize
+// call options, which the channel accepted but did not act on. The default limits
+// must not reject ordinary payloads.
+func TestChannelMessageSizeLimits(t *testing.T) {
+	u := serverURL(t)
+	cli := grpchantesting.NewTestServiceClient(newChannel(t, u))
+	ctx := context.Background()
+	msg := &grpchantesting.Message{Payload: make([]byte, 1024)}
+
+	t.Run("defaults allow a real payload", func(t *testing.T) {
+		if _, err := cli.Unary(ctx, msg); err != nil {
+			t.Fatalf("unary with a 1kb payload failed: %v", err)
+		}
+	})
+	t.Run("unary send limit enforced", func(t *testing.T) {
+		_, err := cli.Unary(ctx, msg, grpc.MaxCallSendMsgSize(10))
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+	})
+	t.Run("unary recv limit enforced", func(t *testing.T) {
+		_, err := cli.Unary(ctx, msg, grpc.MaxCallRecvMsgSize(10))
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+	})
+	t.Run("stream send limit enforced", func(t *testing.T) {
+		str, err := cli.ClientStream(ctx, grpc.MaxCallSendMsgSize(10))
+		if err != nil {
+			t.Fatalf("failed to initiate client stream: %v", err)
+		}
+		if got := status.Code(str.Send(msg)); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v", got)
+		}
+	})
+	t.Run("channel default limit enforced", func(t *testing.T) {
+		limited := grpchantesting.NewTestServiceClient(newChannel(t, u,
+			httpgrpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(10))))
+		_, err := limited.Unary(ctx, msg)
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+	})
+	t.Run("call option overrides channel default", func(t *testing.T) {
+		limited := grpchantesting.NewTestServiceClient(newChannel(t, u,
+			httpgrpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(10))))
+		if _, err := limited.Unary(ctx, msg, grpc.MaxCallRecvMsgSize(1<<20)); err != nil {
+			t.Fatalf("the call's own limit should replace the channel's: %v", err)
+		}
+	})
+	t.Run("unary recv limit rejects before reading the body", func(t *testing.T) {
+		// A limit is only worth having if an over-large response is refused rather
+		// than pulled into memory and measured afterwards. When the response
+		// declares its length, that can happen before a single byte is read.
+		body := &recordingBody{}
+		transport := &fixedResponse{resp: &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{httpgrpc.UnaryRpcContentType_V1}},
+			ContentLength: 1 << 20,
+			Body:          body,
+		}}
+		ch, err := httpgrpc.NewChannel(u, transport)
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+		_, err = grpchantesting.NewTestServiceClient(ch).Unary(ctx, msg, grpc.MaxCallRecvMsgSize(10))
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+		if body.read {
+			t.Error("the response body was read, so the declared length was not acted on")
+		}
+	})
+	t.Run("unary recv default is 100mb", func(t *testing.T) {
+		// A unary response was once unbounded. It now has the same default as a
+		// streaming one, so a caller that sets no limit still gets one.
+		body := &recordingBody{}
+		transport := &fixedResponse{resp: &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{httpgrpc.UnaryRpcContentType_V1}},
+			ContentLength: 100<<20 + 1,
+			Body:          body,
+		}}
+		ch, err := httpgrpc.NewChannel(u, transport)
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+		_, err = grpchantesting.NewTestServiceClient(ch).Unary(ctx, msg)
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+		if body.read {
+			t.Error("the response body was read, so the declared length was not acted on")
+		}
+	})
+	t.Run("stream recv limit rejects before reading the message", func(t *testing.T) {
+		// The size preface announces how big the message is, so an over-large one
+		// can be refused without reading it. The server below announces a large
+		// message and never sends it: if the client waited for the body it would
+		// fail with an unexpected EOF instead of a limit error.
+		announced := make([]byte, 4)
+		binary.BigEndian.PutUint32(announced, 1<<20)
+		svrURL := serveHandler(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", httpgrpc.StreamRpcContentType_V1)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(announced)
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}))
+		str, err := grpchantesting.NewTestServiceClient(newChannel(t, svrURL)).ServerStream(
+			ctx, &grpchantesting.Message{}, grpc.MaxCallRecvMsgSize(10))
+		if err != nil {
+			t.Fatalf("failed to initiate server stream: %v", err)
+		}
+		_, err = str.Recv()
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+	})
+	t.Run("stream recv limit enforced", func(t *testing.T) {
+		// Count makes the server send one message back, echoing the payload.
+		req := &grpchantesting.Message{Payload: make([]byte, 1024), Count: 1}
+		str, err := cli.ServerStream(ctx, req, grpc.MaxCallRecvMsgSize(10))
+		if err != nil {
+			t.Fatalf("failed to initiate server stream: %v", err)
+		}
+		_, err = str.Recv()
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+	})
+	t.Run("recv limit applies to the trailer", func(t *testing.T) {
+		// The sender exempts the trailer from its own limit, so that a stream can
+		// always report how it ended. The receiver grants no such exemption: the
+		// trailer arrives on the same connection as everything else, and a limit
+		// that did not cover it would not bound much.
+		//
+		// The cost of that is the RPC's real outcome, which the caller never learns.
+		// See the TODO on checkSendSize.
+		req := &grpchantesting.Message{
+			Trailers: map[string][]byte{"large-trailer": make([]byte, 1024)},
+		}
+		str, err := cli.ServerStream(ctx, req, grpc.MaxCallRecvMsgSize(100))
+		if err != nil {
+			t.Fatalf("failed to initiate server stream: %v", err)
+		}
+		_, err = str.Recv()
+		if got := status.Code(err); got != codes.ResourceExhausted {
+			t.Fatalf("expected ResourceExhausted, got %v (err=%v)", got, err)
+		}
+	})
+}
+
 // TestServerErrorsUseProtocolFormat checks that once a protocol has been
 // recognized from the content-type, failures are reported in that protocol's
 // error format rather than as bare HTTP errors. For httpgrpc that means an
@@ -538,4 +693,28 @@ func newChannel(t *testing.T, u *url.URL, opts ...httpgrpc.ChannelOption) *httpg
 		t.Fatalf("failed to create channel: %v", err)
 	}
 	return ch
+}
+
+// recordingBody reports whether anything tried to read it.
+type recordingBody struct {
+	read bool
+}
+
+func (b *recordingBody) Read([]byte) (int, error) {
+	b.read = true
+	return 0, io.EOF
+}
+
+func (b *recordingBody) Close() error { return nil }
+
+// fixedResponse is a transport that answers every request with the same response,
+// so that a test can hand the client a reply it could not get from a real server.
+type fixedResponse struct {
+	resp *http.Response
+}
+
+func (f *fixedResponse) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp := *f.resp
+	resp.Request = r
+	return &resp, nil
 }

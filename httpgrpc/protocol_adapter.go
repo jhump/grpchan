@@ -60,7 +60,12 @@ type protocolAdapter interface {
 // it labels the request, may decide how messages are framed, and is what a
 // response has to be encoded with. A protocol that cannot carry the codec
 // reports an error.
-type clientProtocolAdapterFactory func(codecName string) (clientProtocolAdapter, error)
+//
+// The receive limit is given at construction because deframing is where it has to
+// be applied: a frame announces or delimits its own size, so the adapter is what
+// can refuse an over-large message before reading it. It is per-RPC for the same
+// reason the adapter is -- it comes from that call's options.
+type clientProtocolAdapterFactory func(codecName string, maxRecv int) (clientProtocolAdapter, error)
 
 // clientProtocolAdapter provides the methods needed to implement the client side of
 // an HTTP-based protocol.
@@ -309,7 +314,7 @@ func sizePrefixedFrame(data []byte, isTrailer bool) ([][]byte, error) {
 // readSizePrefixedFrame reads one size-prefixed frame from r, returning the
 // message data and whether that data is a trailer. It returns io.EOF when the
 // stream ends cleanly between frames.
-func readSizePrefixedFrame(r io.Reader) ([]byte, bool, error) {
+func readSizePrefixedFrame(r io.Reader, maxRecv int) ([]byte, bool, error) {
 	sz, err := readSizePreface(r)
 	if err != nil {
 		return nil, false, err
@@ -318,8 +323,12 @@ func readSizePrefixedFrame(r io.Reader) ([]byte, bool, error) {
 	if isTrailer {
 		sz = -sz
 	}
-	if sz > maxMessageSize {
-		return nil, false, fmt.Errorf("bad size preface: indicated size is too large: %d", sz)
+	// The preface announces the size, so an over-large message is refused here,
+	// before it is read, rather than after it has been pulled into memory. This is
+	// also what keeps a bogus preface from being turned into an allocation of
+	// whatever size it names.
+	if err := checkRecvSize(int(sz), maxRecv); err != nil {
+		return nil, false, err
 	}
 	data := make([]byte, sz)
 	if _, err := io.ReadAtLeast(r, data, int(sz)); err != nil {

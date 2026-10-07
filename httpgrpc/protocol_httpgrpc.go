@@ -37,6 +37,10 @@ type httpGRPCClientProtocolAdapter struct {
 	// but stored as-is.
 	codecName string
 	codec     encoding.CodecV2
+	// maxRecv bounds a single response message. Deframing is where it applies: both
+	// framings can refuse an over-large message before reading it, one from the size
+	// preface and the other from the decoder's own limit.
+	maxRecv int
 	// respBody is captured by processStreamHeaders and read by readStreamResponse.
 	// sseDec is created over it when the server replies with server-sent events,
 	// and must persist across messages because it buffers.
@@ -46,7 +50,7 @@ type httpGRPCClientProtocolAdapter struct {
 
 var _ clientProtocolAdapter = (*httpGRPCClientProtocolAdapter)(nil)
 
-func newHTTPGRPCClientAdapter(codecName string) (clientProtocolAdapter, error) {
+func newHTTPGRPCClientAdapter(codecName string, maxRecv int) (clientProtocolAdapter, error) {
 	switch codecName {
 	case grpcproto.Name, jsonCodecName:
 	default:
@@ -56,7 +60,7 @@ func newHTTPGRPCClientAdapter(codecName string) (clientProtocolAdapter, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &httpGRPCClientProtocolAdapter{codecName: codecName, codec: codec}, nil
+	return &httpGRPCClientProtocolAdapter{codecName: codecName, codec: codec, maxRecv: maxRecv}, nil
 }
 
 func (h *httpGRPCClientProtocolAdapter) isJSON() bool {
@@ -140,7 +144,9 @@ func (h *httpGRPCClientProtocolAdapter) processUnaryResponse(resp *http.Response
 		return result, err
 	}
 
-	result.message, err = io.ReadAll(resp.Body)
+	// The body is the whole message in this protocol, so a declared length is the
+	// message's size, and one over the limit is refused without reading any of it.
+	result.message, err = readBodyLimited(resp.Body, resp.ContentLength, h.maxRecv)
 	if err != nil {
 		return result, err
 	}
@@ -170,7 +176,11 @@ func (h *httpGRPCClientProtocolAdapter) processStreamHeaders(resp *http.Response
 	// decoder that buffers across messages, so it is created once here.
 	h.respBody = resp.Body
 	if mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mediaType == EventStreamContentType {
-		h.sseDec = sse.NewDecoder(resp.Body)
+		// Server-sent events carry no size ahead of the data, so the limit is given
+		// to the decoder, which fails as soon as an event exceeds it rather than
+		// reading all of it first. Trailer events are not exempt here, as they are
+		// elsewhere, because an event's type is not known until it has been read.
+		h.sseDec = sse.NewDecoderWithMaxData(resp.Body, h.maxRecv)
 	}
 	stat := statFromResponse(resp, h.codec)
 	return md, stat.Err()
@@ -221,11 +231,11 @@ func (h *httpGRPCClientProtocolAdapter) readStreamFrame() ([]byte, bool, error) 
 	if h.sseDec != nil {
 		event, err := h.sseDec.Decode()
 		if err != nil {
-			return nil, false, err
+			return nil, false, sseRecvError(err)
 		}
 		return event.Data, event.Type == sseTrailerEvent, nil
 	}
-	return readSizePrefixedFrame(h.respBody)
+	return readSizePrefixedFrame(h.respBody, h.maxRecv)
 }
 
 // httpGRPCServerProtocolAdapter is created per-RPC by newHTTPGRPCServerAdapter, so
@@ -360,7 +370,7 @@ func (h *httpGRPCServerProtocolAdapter) readStreamRequest() ([]byte, error) {
 		return msg, nil
 	}
 
-	data, isTrailer, err := readSizePrefixedFrame(h.reqBody)
+	data, isTrailer, err := readSizePrefixedFrame(h.reqBody, maxMessageSize)
 	if err != nil {
 		return nil, err
 	}

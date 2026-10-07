@@ -49,6 +49,10 @@ type channelOptions struct {
 	// httpgrpc protocol, which is the only one implemented so far; it is the seam
 	// through which gRPC-Web and ConnectRPC will be selected. See newAdapter.
 	newProtocol clientProtocolAdapterFactory
+
+	// defaultCallOpts are applied to every call, ahead of the call's own options;
+	// see WithDefaultCallOptions.
+	defaultCallOpts []grpc.CallOption
 }
 
 func (o *channelOptions) setCodec(name string) error {
@@ -92,6 +96,33 @@ func WithJSONEncoding(useJSONEncoding bool) ChannelOption {
 		// an earlier WithJSONEncoding(true) rather than leaving JSON in place.
 		return o.setCodec(name)
 	}
+}
+
+// WithDefaultCallOptions configures call options that apply to every call made
+// with the channel, such as grpc.MaxCallRecvMsgSize. The options given to an
+// individual call are applied after these, so a call can override any of them.
+// This mirrors the dial option of the same name in gRPC-Go.
+//
+// Only the call options this package understands have any effect, here as on a
+// single call: grpc.Header, grpc.Trailer, grpc.Peer, grpc.PerRPCCredentials,
+// grpc.MaxCallRecvMsgSize and grpc.MaxCallSendMsgSize. Others are ignored.
+func WithDefaultCallOptions(opts ...grpc.CallOption) ChannelOption {
+	return func(o *channelOptions) error {
+		o.defaultCallOpts = append(o.defaultCallOpts, opts...)
+		return nil
+	}
+}
+
+// callOptions gathers the options in effect for a single call: the channel's
+// defaults followed by the call's own, so that the call's take precedence.
+func (o channelOptions) callOptions(opts []grpc.CallOption) *internal.CallOptions {
+	if len(o.defaultCallOpts) == 0 {
+		return internal.GetCallOptions(opts)
+	}
+	all := make([]grpc.CallOption, 0, len(o.defaultCallOpts)+len(opts))
+	all = append(all, o.defaultCallOpts...)
+	all = append(all, opts...)
+	return internal.GetCallOptions(all)
 }
 
 // NewChannel creates a new Channel with the given base URL and transport, both of
@@ -159,7 +190,7 @@ func (ch *Channel) Invoke(ctx context.Context, methodName string, req, resp inte
 	if err != nil {
 		return err
 	}
-	copts := internal.GetCallOptions(opts)
+	copts := chOpts.callOptions(opts)
 
 	reqUrl := *ch.BaseURL
 	reqUrl.Path = path.Join(reqUrl.Path, methodName)
@@ -168,7 +199,9 @@ func (ch *Channel) Invoke(ctx context.Context, methodName string, req, resp inte
 	if err != nil {
 		return err
 	}
-	protocol, err := chOpts.newAdapter()
+	// The adapter is given the limit because deframing is where it applies.
+	maxRecv := limitOrDefault(copts.MaxRecv, defaultMaxRecv)
+	protocol, err := chOpts.newAdapter(maxRecv)
 	if err != nil {
 		return err
 	}
@@ -182,8 +215,10 @@ func (ch *Channel) Invoke(ctx context.Context, methodName string, req, resp inte
 		return err
 	}
 	b := msgBuf.Materialize()
-
-	// TODO: enforce max send and receive size in call options
+	maxSend := limitOrDefault(copts.MaxSend, defaultMaxSend)
+	if len(b) > maxSend {
+		return status.Errorf(codes.ResourceExhausted, "request payload too large to send: %v > %v", len(b), maxSend)
+	}
 
 	body, err := protocol.unaryMessage(b)
 	if err != nil {
@@ -238,7 +273,7 @@ func (ch *Channel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodN
 	if err != nil {
 		return nil, err
 	}
-	copts := internal.GetCallOptions(opts)
+	copts := chOpts.callOptions(opts)
 
 	reqUrl := *ch.BaseURL
 	reqUrl.Path = path.Join(reqUrl.Path, methodName)
@@ -247,7 +282,8 @@ func (ch *Channel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodN
 	if err != nil {
 		return nil, err
 	}
-	protocol, err := chOpts.newAdapter()
+	// The adapter is given the limit because deframing is where it applies.
+	protocol, err := chOpts.newAdapter(limitOrDefault(copts.MaxRecv, defaultMaxRecv))
 	if err != nil {
 		return nil, err
 	}
@@ -276,6 +312,7 @@ func (ch *Channel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodN
 		baseUrl:    ch.BaseURL,
 		protocol:   protocol,
 		codec:      chOpts.codec,
+		maxSend:    limitOrDefault(copts.MaxSend, defaultMaxSend),
 		w:          w,
 		respStream: desc.ServerStreams,
 		rCh:        make(chan []byte),
@@ -385,6 +422,10 @@ type clientStream struct {
 
 	protocol clientProtocolAdapter
 	codec    encoding.CodecV2
+	// maxSend bounds a single request message. The receive limit has no counterpart
+	// here: it belongs to the adapter, which is what deframes a response and so can
+	// refuse an over-large message before reading it.
+	maxSend int
 
 	// respStream is set to indicate whether client expects stream response; unary if false
 	respStream bool
@@ -469,14 +510,19 @@ func (cs *clientStream) SendMsg(m interface{}) error {
 		return io.EOF
 	}
 
+	// The send limit is enforced by sendMsgLocked, which is where the message is
+	// encoded and so where its size is known without encoding it twice.
 	cs.wErr = cs.sendMsgLocked(m)
 	var marshalErr marshalError
 	if errors.As(cs.wErr, &marshalErr) {
-		// Like gRPC-Go, a message that can't be encoded ends the RPC, since nothing
-		// else will: the server is left waiting for the message. Failures to write
-		// are left alone, since they mean the RPC is already ending, and RecvMsg is
-		// where its real result is reported.
 		cs.wErr = status.Errorf(codes.Internal, "could not marshal message: %v", marshalErr.err)
+	}
+	if marshalErr.err != nil || isLimitError(cs.wErr) {
+		// Mirrors gRPC-Go, which calls finish on the stream for errors that SendMsg
+		// itself produced, since they are the caller's doing rather than a transport
+		// failure, and nothing else would end the RPC: the server is left waiting for
+		// the message. Transport failures are left alone: those surface from RecvMsg,
+		// which is where a caller is expected to look for the real result.
 		cs.endStream(cs.wErr)
 	}
 	return cs.wErr
@@ -486,7 +532,8 @@ func (cs *clientStream) SendMsg(m interface{}) error {
 //
 // The error is recorded first so that it is what a subsequent RecvMsg reports.
 // Cancelling alone would leave the reader to fill in a cancellation instead,
-// which explains far less.
+// which is the mismatch grpc-java has (grpc/grpc-java#11245): a client that
+// exceeded a limit is told the call was cancelled and cannot tell why.
 func (cs *clientStream) endStream(err error) {
 	cs.rMu.Lock()
 	if cs.rErr == nil {
@@ -497,6 +544,16 @@ func (cs *clientStream) endStream(err error) {
 	cs.cancel()
 }
 
+// endError returns the error to report for a stream whose context has ended. A
+// stream that already knows why it ended reports that instead of the
+// cancellation, which is usually a consequence of it and explains far less.
+func (cs *clientStream) endError() error {
+	if done, err := cs.readErrorIfDone(); done && err != nil {
+		return err
+	}
+	return statusFromContextError(cs.ctx.Err())
+}
+
 func (cs *clientStream) RecvMsg(m interface{}) error {
 	if done, err := cs.readErrorIfDone(); done {
 		return err
@@ -504,7 +561,7 @@ func (cs *clientStream) RecvMsg(m interface{}) error {
 
 	select {
 	case <-cs.ctx.Done():
-		return statusFromContextError(cs.ctx.Err())
+		return cs.endError()
 	case data, ok := <-cs.rCh:
 		if !ok {
 			return cs.errAfterClose()
@@ -520,7 +577,7 @@ func (cs *clientStream) RecvMsg(m interface{}) error {
 			// subsequent call to Trailer.
 			select {
 			case <-cs.ctx.Done():
-				return statusFromContextError(cs.ctx.Err())
+				return cs.endError()
 			case _, ok := <-cs.rCh:
 				if ok {
 					return cs.tooManyResponses()
@@ -544,6 +601,7 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 	var rErr error
 	var reply *http.Response
 	rMuHeld := false
+	cancelOnDone := false
 	readySignalled := false
 
 	// onReady releases Header and the first RecvMsg. It must run exactly once,
@@ -585,13 +643,33 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 			cs.done = true
 			readPipe.CloseWithError(rErr)
 			close(cs.rCh)
+			if cancelOnDone {
+				// After the reason is recorded, never before: a caller that is waiting
+				// on the stream must see it, not the cancellation it causes.
+				cs.cancel()
+			}
 		}()
 
 		if reply == nil {
 			return
 		}
-		// Read off whatever is left, so that the connection can be reused.
-		_, _ = io.Copy(io.Discard, reply.Body)
+		// Read off whatever little is left, so that the connection can be reused. How
+		// far that got is not worth inspecting: net/http pools a connection whose body
+		// reached EOF and drops one whose body did not, so closing does the right thing
+		// either way, and over HTTP/2 it costs only the stream.
+		//
+		// It is skipped when a message was refused for its size, since the preface has
+		// already said that what remains is larger than this process was willing to
+		// hold, which makes it too large to discard as well.
+		//
+		// This runs after the caller has been released above, and outside the lock,
+		// because the body outlives the RPC: a server can report how a stream ended
+		// before its handler returns, and the body stays open until it does. Draining
+		// first would hold the caller for as long as that handler cared to take, which
+		// is the delay that reporting a status early exists to avoid.
+		if !isLimitError(rErr) {
+			_, _ = io.CopyN(io.Discard, reply.Body, drainLimit)
+		}
 		_ = reply.Body.Close()
 	}()
 
@@ -629,20 +707,27 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 	onReady(nil, md)
 
 	for {
-		// TODO: enforce max send and receive size in call options
-
 		data, trailers, err := cs.protocol.readStreamResponse()
 		if err != nil {
 			// End of stream: err is io.EOF if it completed successfully, otherwise
 			// the RPC's failure status. Either way the adapter has given us the
 			// trailing metadata.
+			if isLimitError(err) {
+				// gRPC-Go ends the RPC on any receive error, so a stream that has
+				// been sent something too big does not stay open waiting for the
+				// rest of it.
+				cancelOnDone = true
+			}
 			cs.rMu.Lock()
 			rMuHeld = true // defer above will unlock for us
 			cs.trailers = trailers
 			if len(trailers) > 0 && len(cs.copts.Trailers) > 0 {
 				cs.copts.SetTrailers(trailers)
 			}
-			cs.rErr = err
+			// Recorded through rErr, not written straight to cs.rErr, so that a
+			// reason the stream already has -- a refused send, say -- survives the
+			// cancellation that followed from it.
+			rErr = err
 			return
 		}
 
@@ -659,11 +744,11 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 
 // newAdapter creates the protocol adapter for a single RPC. Adapters are per-RPC
 // because deframing a response can be stateful; see clientProtocolAdapterFactory.
-func (o channelOptions) newAdapter() (clientProtocolAdapter, error) {
+func (o channelOptions) newAdapter(maxRecv int) (clientProtocolAdapter, error) {
 	if o.newProtocol != nil {
-		return o.newProtocol(o.codecName)
+		return o.newProtocol(o.codecName, maxRecv)
 	}
-	return newHTTPGRPCClientAdapter(o.codecName)
+	return newHTTPGRPCClientAdapter(o.codecName, maxRecv)
 }
 
 func (cs *clientStream) sendMsgLocked(m interface{}) error {
@@ -672,6 +757,9 @@ func (cs *clientStream) sendMsgLocked(m interface{}) error {
 		return marshalError{err}
 	}
 	data := buf.Materialize()
+	if err := checkSendSize(len(data), false, cs.maxSend); err != nil {
+		return err
+	}
 	frames, err := cs.protocol.streamMessage(data)
 	if err != nil {
 		return err
