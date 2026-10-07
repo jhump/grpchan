@@ -247,11 +247,17 @@ type httpGRPCServerProtocolAdapter struct {
 	// streams are read as a sequence of JSON values and written as server-sent
 	// events.
 	codecName string
+	// maxRecv bounds a single request message, for the same reason the client
+	// adapter has one: deframing is where an over-large message can be refused
+	// before it is read.
+	maxRecv int
 	// reqBody is the request body, read by processUnaryRequest and
 	// readStreamRequest. jsonDec is created over it on first use, and must persist
 	// across messages because it buffers.
 	reqBody io.ReadCloser
 	jsonDec *json.Decoder
+	// contentLength is the request's declared length, or -1 if it declared none.
+	contentLength int64
 
 	// w is the response writer this adapter owns.
 	w http.ResponseWriter
@@ -261,10 +267,12 @@ var _ serverProtocolAdapter = &httpGRPCServerProtocolAdapter{}
 
 func newHTTPGRPCServerAdapter(req *http.Request, w http.ResponseWriter, codecName string, opts handlerOpts) *httpGRPCServerProtocolAdapter {
 	return &httpGRPCServerProtocolAdapter{
-		errFunc:   opts.errFunc,
-		codecName: codecName,
-		reqBody:   req.Body,
-		w:         w,
+		errFunc:       opts.errFunc,
+		codecName:     codecName,
+		maxRecv:       opts.recvLimit(),
+		reqBody:       req.Body,
+		contentLength: req.ContentLength,
+		w:             w,
 	}
 }
 
@@ -297,7 +305,9 @@ func (h *httpGRPCServerProtocolAdapter) processHeaders(header http.Header) (requ
 
 func (h *httpGRPCServerProtocolAdapter) processUnaryRequest() ([]byte, error) {
 	// This protocol adds no framing to a unary body: the whole body is the message.
-	return io.ReadAll(h.reqBody)
+	// So a declared length is the message's size, and one over the limit is refused
+	// without reading any of it.
+	return readBodyLimited(h.reqBody, h.contentLength, h.maxRecv)
 }
 
 // writeUnary reports the RPC's status and trailing metadata as headers, so they
@@ -359,18 +369,20 @@ func (h *httpGRPCServerProtocolAdapter) sendStreamHeaders(md metadata.MD) {
 func (h *httpGRPCServerProtocolAdapter) readStreamRequest() ([]byte, error) {
 	if h.isJSON() {
 		// A JSON request body is a sequence of JSON values. The decoder buffers, so
-		// it is created once and reused for the life of the stream.
+		// it is created once and reused for the life of the stream. It is bounded
+		// because such a value announces no size: without a limit underneath it, the
+		// decoder would buffer a value of any size and only then could it be measured.
 		if h.jsonDec == nil {
-			h.jsonDec = json.NewDecoder(h.reqBody)
+			h.jsonDec = newLimitedJSONDecoder(h.reqBody, h.maxRecv)
 		}
-		var msg json.RawMessage
-		if err := h.jsonDec.Decode(&msg); err != nil {
+		msg, err := decodeJSONValue(h.jsonDec)
+		if err != nil {
 			return nil, err
 		}
 		return msg, nil
 	}
 
-	data, isTrailer, err := readSizePrefixedFrame(h.reqBody, maxMessageSize)
+	data, isTrailer, err := readSizePrefixedFrame(h.reqBody, h.maxRecv)
 	if err != nil {
 		return nil, err
 	}

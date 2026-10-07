@@ -3,6 +3,7 @@ package httpgrpc
 import (
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -289,6 +290,94 @@ func (a strAddr) Network() string {
 }
 
 func (a strAddr) String() string { return string(a) }
+
+// jsonValueTooLargeError reports a single JSON value that exceeded the limit.
+//
+// As with a server-sent event, the reader gives up as soon as the limit is
+// passed rather than reading on to find out how big the value really is, so Read
+// is a lower bound on its full size.
+type jsonValueTooLargeError struct {
+	// Read is the number of bytes read for the value before it was abandoned.
+	Read int64
+	// Limit is the maximum size of a single value the reader will accept.
+	Limit int
+}
+
+func (e *jsonValueTooLargeError) Error() string {
+	return fmt.Sprintf("json value too large: read %d bytes with a limit of %d", e.Read, e.Limit)
+}
+
+// jsonValueLimiter bounds a single value in a stream of concatenated JSON values.
+//
+// A JSON stream carries no size ahead of each value, so the extent of one is only
+// known once it has been parsed. Rather than let the decoder buffer a value of any
+// size and measure it afterwards, this sits underneath the decoder and never hands
+// it more than the limit beyond the end of the last value it finished. That end is
+// where consumed reports, which is the decoder's own input offset.
+//
+// Capping each read is what makes the test reliable, rather than simply failing
+// once that much is outstanding. The decoder refills only when the buffered data
+// does not hold a complete value, but a refill reads as much as it is given, which
+// may run well past the current value and into later ones. Bounding the read means
+// anything still outstanding belongs to the value being parsed now, so a decoder
+// that wants yet more has a value that genuinely exceeds the limit.
+//
+// The bound covers any whitespace between values as well, which costs a few bytes
+// of headroom against a limit measured in megabytes.
+type jsonValueLimiter struct {
+	r     io.Reader
+	limit int
+	// consumed reports how much of the stream has been decoded into values already.
+	consumed func() int64
+	read     int64
+	err      error
+}
+
+func (j *jsonValueLimiter) Read(p []byte) (int, error) {
+	if j.err != nil {
+		return 0, j.err
+	}
+	// One byte past the limit, so that a value of exactly the limit still fits and
+	// the decoder asking for more is unambiguous.
+	outstanding := j.read - j.consumed()
+	allowed := int64(j.limit) + 1 - outstanding
+	if allowed <= 0 {
+		// Sticky, so that a decoder which reads again after an error cannot get
+		// past this by reading the rest of the oversized value.
+		j.err = &jsonValueTooLargeError{Read: outstanding, Limit: j.limit}
+		return 0, j.err
+	}
+	if int64(len(p)) > allowed {
+		p = p[:allowed]
+	}
+	n, err := j.r.Read(p)
+	j.read += int64(n)
+	return n, err
+}
+
+// newLimitedJSONDecoder decodes a stream of concatenated JSON values, refusing
+// any single value larger than maxValue.
+func newLimitedJSONDecoder(r io.Reader, maxValue int) *json.Decoder {
+	limiter := &jsonValueLimiter{r: r, limit: maxValue}
+	d := json.NewDecoder(limiter)
+	limiter.consumed = d.InputOffset
+	return d
+}
+
+// decodeJSONValue reads the next value from a decoder built by
+// newLimitedJSONDecoder, reporting one that exceeded the limit as a refusal
+// rather than as an opaque read failure.
+func decodeJSONValue(d *json.Decoder) (json.RawMessage, error) {
+	var msg json.RawMessage
+	if err := d.Decode(&msg); err != nil {
+		var tooLarge *jsonValueTooLargeError
+		if errors.As(err, &tooLarge) {
+			return nil, recvTooLarge("payload too large to receive: %v", tooLarge)
+		}
+		return nil, err
+	}
+	return msg, nil
+}
 
 // sseRecvError reports an event the decoder refused for exceeding its limit as a
 // refusal rather than as an opaque read failure. Other errors pass through.

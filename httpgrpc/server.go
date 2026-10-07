@@ -146,6 +146,21 @@ func (ho HandlerOption) apply(s *Server) {
 
 type handlerOpts struct {
 	errFunc func(context.Context, *status.Status, http.ResponseWriter)
+	// maxRecv and maxSend are zero when no limit was configured, which is also the
+	// case for a Server built as a struct literal. They are read through recvLimit
+	// and sendLimit so that the defaults apply either way.
+	maxRecv int
+	maxSend int
+}
+
+// recvLimit returns the largest request message the handler will accept.
+func (h *handlerOpts) recvLimit() int {
+	return limitOrDefault(h.maxRecv, defaultMaxRecv)
+}
+
+// sendLimit returns the largest response message the handler will produce.
+func (h *handlerOpts) sendLimit() int {
+	return limitOrDefault(h.maxSend, defaultMaxSend)
 }
 
 // ErrorRenderer returns a HandlerOption that will cause the handler to use the
@@ -161,6 +176,30 @@ type handlerOpts struct {
 func ErrorRenderer(errFunc func(reqCtx context.Context, st *status.Status, response http.ResponseWriter)) HandlerOption {
 	return func(h *handlerOpts) {
 		h.errFunc = errFunc
+	}
+}
+
+// WithMaxRecvMsgSize returns a HandlerOption that sets the largest request
+// message the handler will accept. A request message larger than this is
+// rejected with a ResourceExhausted status, without being read into memory.
+//
+// A value of zero or less selects the default, which is 100mb. The limit applies
+// to every request message, unary or streaming, in any encoding.
+func WithMaxRecvMsgSize(limit int) HandlerOption {
+	return func(h *handlerOpts) {
+		h.maxRecv = limit
+	}
+}
+
+// WithMaxSendMsgSize returns a HandlerOption that sets the largest response
+// message the handler will send. Attempting to send a larger one fails the RPC
+// with a ResourceExhausted status rather than writing a partial response.
+//
+// A value of zero or less selects the default, which is the largest message the
+// protocol can describe.
+func WithMaxSendMsgSize(limit int) HandlerOption {
+	return func(h *handlerOpts) {
+		h.maxSend = limit
 	}
 }
 
@@ -252,7 +291,19 @@ func handleMethod(svr interface{}, serviceName string, desc *grpc.MethodDesc, un
 		if call == nil {
 			return
 		}
-		defer drainAndClose(r.Body)
+		// Draining the body lets the connection be reused, but not when the reason
+		// the request failed is that the body was too big to accept: reading the rest
+		// of it would pull in the very bytes the limit exists to refuse. Give up the
+		// connection instead, which is also what makes the refusal reach the caller
+		// promptly, since the response is not written until this handler returns.
+		refused := false
+		defer func() {
+			if refused {
+				_ = r.Body.Close()
+				return
+			}
+			_ = drainAndClose(r.Body)
+		}()
 		defer call.cancel()
 
 		protocol, ctx := call.protocol, call.ctx
@@ -264,9 +315,18 @@ func handleMethod(svr interface{}, serviceName string, desc *grpc.MethodDesc, un
 			return
 		}
 
+		// The adapter refuses a request message over the limit, since only it can
+		// tell how much of the body is message: it refuses one that announces itself
+		// as too large without reading it, and reads one that does not through a
+		// limit.
 		req, err := protocol.processUnaryRequest()
 		if err != nil {
-			fail(status.Error(codes.Canceled, err.Error()))
+			refused = isLimitError(err)
+			if _, ok := status.FromError(err); !ok {
+				// Anything else is a failure to read the body at all.
+				err = status.Error(codes.Canceled, err.Error())
+			}
+			fail(err)
 			return
 		}
 
@@ -291,10 +351,17 @@ func handleMethod(svr interface{}, serviceName string, desc *grpc.MethodDesc, un
 			fail(status.Errorf(codes.Internal, "could not encode response: %v", err))
 			return
 		}
+		b := respBuf.Materialize()
+		// Checked where the response is encoded, so the limit costs no extra work.
+		if maxSend := opts.sendLimit(); len(b) > maxSend {
+			fail(status.Errorf(codes.ResourceExhausted,
+				"response payload too large to send: %v > %v", len(b), maxSend))
+			return
+		}
 
 		protocol.writeUnary(ctx, unaryReply{
 			headers:  sts.GetHeaders(),
-			message:  respBuf.Materialize(),
+			message:  b,
 			trailers: sts.GetTrailers(),
 		})
 	}
@@ -321,8 +388,31 @@ func handleStream(svr interface{}, serviceName string, desc *grpc.StreamDesc, st
 		if call == nil {
 			return
 		}
-		defer drainAndClose(r.Body)
+		// A stream that refused a message is not drained, for the same reason a unary
+		// request is not: what remains is the message the limit rejected.
+		var str *serverStream
+		defer func() {
+			if str != nil && isLimitError(str.finishError()) {
+				_ = r.Body.Close()
+				return
+			}
+			_ = drainAndClose(r.Body)
+		}()
 		defer call.cancel()
+
+		// A stream reads and writes at the same time, which is not what net/http's
+		// HTTP/1 server expects of a handler: before it will write response headers
+		// with the request body unread, it drains up to 256kb of that body so that the
+		// connection stays reusable. Draining waits on a peer that is itself waiting
+		// for the response, so a handler which answers before it has finished reading
+		// deadlocks with its own caller. A stream that ends early always does, since
+		// the message that ended it is still on the wire.
+		//
+		// Turning that off leaves the draining to this handler, which does it on the
+		// way out, where nothing is waiting on the result. An error means the
+		// ResponseWriter does not offer the choice, which is not fatal: the drain
+		// stays, and so does the hazard it poses, exactly as before.
+		_ = http.NewResponseController(w).EnableFullDuplex()
 
 		if err != nil {
 			call.protocol.sendStreamHeaders(nil)
@@ -330,9 +420,10 @@ func handleStream(svr interface{}, serviceName string, desc *grpc.StreamDesc, st
 			return
 		}
 
-		str := &serverStream{
+		str = &serverStream{
 			protocol:  call.protocol,
 			codec:     call.codec,
+			maxSend:   opts.sendLimit(),
 			w:         w,
 			reqStream: desc.ClientStreams,
 		}
@@ -343,6 +434,10 @@ func handleStream(svr interface{}, serviceName string, desc *grpc.StreamDesc, st
 		} else {
 			err = desc.Handler(svr, str)
 		}
+		// The handler's error only ends the stream if nothing else already has. A
+		// message that exceeded a size limit ended it where it was refused, and that
+		// is the reason worth reporting: whatever the handler made of the error it
+		// was given is a symptom of it.
 		str.finish(err)
 	}
 }
@@ -472,10 +567,20 @@ func asTrailerProto(md metadata.MD) map[string]*TrailerValues {
 // holds no knowledge of how messages are framed or how a stream is terminated: it
 // encodes and decodes messages with a codec, and defers framing to the adapter, so
 // that each protocol can frame differently.
+//
+// It has three mutexes, which are always acquired in the order they are declared
+// below: rmu, then wmu, then lmu. Ending the stream is what makes more than one of
+// them a possibility, since a message refused while receiving must be reported by
+// writing. A method whose name ends in Locked expects a lock to be held already,
+// and names which one; every other method takes what it needs itself.
 type serverStream struct {
 	ctx      context.Context
 	protocol serverProtocolAdapter
 	codec    encoding.CodecV2
+	// maxSend bounds a single response message. The receive limit has no
+	// counterpart here: it belongs to the adapter, which is what deframes a request
+	// and so can refuse an over-large message before reading it.
+	maxSend int
 	// reqStream indicates whether the client may send more than one message.
 	reqStream bool
 
@@ -492,21 +597,110 @@ type serverStream struct {
 	headersSent bool
 	writeFailed bool
 	tr          []metadata.MD
+
+	// lmu protects finished and finishErr, which are reachable from both
+	// directions of the stream and so cannot live under either of the locks above.
+	lmu       sync.Mutex
+	finished  bool
+	finishErr error
 }
 
 var _ grpc.ServerStream = (*serverStream)(nil)
 
-// finish ends the stream once the handler has returned, writing the terminating
-// message that reports err as its outcome.
+// finish ends the stream, recording err as its outcome and writing the
+// terminating message that reports it. Only the first call has any effect, since
+// a stream can only end once and the first reason for it is the one that explains
+// the rest; later calls, including the one the handler's return produces, are
+// dropped.
+//
+// A stream that refuses a message for exceeding a size limit ends here, rather
+// than waiting for the handler to return. gRPC-Go ends such an RPC outright by
+// resetting the HTTP/2 stream, which a handler built on net/http cannot do: the
+// only way out is to return, which the handler may not do promptly, or at all.
+// But the protocols handled here carry the trailer as a message in the response
+// body rather than as an HTTP trailer, so it can be written the moment the stream
+// ends instead of whenever the handler gets around to returning. Every later
+// operation on the stream then fails with the recorded error, which is enough to
+// unwind a handler that checks what it is told, and a handler that does not check
+// costs the caller nothing but the connection.
+//
+// Reporting the recorded outcome in preference to the handler's is also what
+// gRPC-Java gets wrong in https://github.com/grpc/grpc-java/issues/11245, where a
+// stream reset can race the trailers and leave the client with CANCELLED instead
+// of RESOURCE_EXHAUSTED.
+//
+// One thing is lost: trailer metadata the handler adds after the stream has ended
+// never reaches the caller, because the message it would have travelled in is
+// already written. gRPC-Go loses it too, once a status is out.
+//
+// The caller must hold neither wmu nor lmu; see finishLocked for a caller that
+// already holds wmu.
 func (s *serverStream) finish(err error) {
+	if !s.recordFinish(err) {
+		return
+	}
+
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 
 	s.writeTrailerLocked(err)
 }
 
+// finishLocked is finish for a caller that already holds wmu. The caller must not
+// hold lmu.
+func (s *serverStream) finishLocked(err error) {
+	if !s.recordFinish(err) {
+		return
+	}
+
+	s.writeTrailerLocked(err)
+}
+
+// recordFinish records the outcome of the stream, reporting whether this call is
+// the one that ended it and so owes the caller a terminating message. It takes
+// lmu, which is why it does not hold it while the message is written: doing so
+// would put a socket write inside the lock that both directions of the stream
+// contend for.
+func (s *serverStream) recordFinish(err error) bool {
+	s.lmu.Lock()
+	defer s.lmu.Unlock()
+
+	if s.finished {
+		return false
+	}
+	s.finished = true
+	s.finishErr = err
+	return true
+}
+
+// endedError returns the error that an operation on an ended stream reports, or
+// nil if the stream has not ended: the error it ended with, or io.EOF if it
+// ended successfully, as gRPC reports a send on a stream that is closed.
+func (s *serverStream) endedError() error {
+	s.lmu.Lock()
+	defer s.lmu.Unlock()
+
+	if !s.finished {
+		return nil
+	}
+	if s.finishErr != nil {
+		return s.finishErr
+	}
+	return io.EOF
+}
+
+// finishError returns the error the stream ended with, or nil if it has not ended
+// or ended without one.
+func (s *serverStream) finishError() error {
+	s.lmu.Lock()
+	defer s.lmu.Unlock()
+
+	return s.finishErr
+}
+
 // writeTrailerLocked writes the final frame of the response, which carries the
-// status of the RPC and any trailer metadata. The caller must hold wmu.
+// status of the RPC and any trailer metadata. The caller must hold wmu, and must
+// have won the race in recordFinish, so that exactly one such frame is written.
 func (s *serverStream) writeTrailerLocked(err error) {
 	if s.writeFailed {
 		// A stream whose last write failed is in no state to report anything.
@@ -566,6 +760,12 @@ func (s *serverStream) SendMsg(m interface{}) error {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
 
+	// Checked under wmu, which finish also holds while it writes the final frame,
+	// so that no message can follow it.
+	if err := s.endedError(); err != nil {
+		return err
+	}
+
 	if s.writeFailed {
 		// strange, but simulates what happens in real GRPC: stream
 		// is closed after a write failure, and trying to send message
@@ -575,7 +775,13 @@ func (s *serverStream) SendMsg(m interface{}) error {
 
 	s.sendHeadersLocked() // sending a message sends the headers implicitly
 	err := s.sendMsgLocked(m)
-	if err != nil {
+	if isLimitError(err) {
+		// A refused message was never written, so the stream is still able to
+		// carry a status; it ends here rather than being marked as failed, which
+		// would suppress the trailer and leave the caller with a truncated
+		// response instead of an explanation.
+		s.finishLocked(err)
+	} else if err != nil {
 		s.writeFailed = true
 	}
 	return err
@@ -585,6 +791,10 @@ func (s *serverStream) RecvMsg(m interface{}) error {
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
 
+	if err := s.endedError(); err != nil {
+		return err
+	}
+
 	if !s.reqStream && s.recvd > 0 {
 		return io.EOF
 	}
@@ -592,6 +802,12 @@ func (s *serverStream) RecvMsg(m interface{}) error {
 	s.recvd++
 
 	if err := s.recvMsgLocked(m); err != nil {
+		if isLimitError(err) {
+			// The rest of the request body belongs to a message that was refused, so
+			// there is no way to find the start of the next one. Ending the stream is
+			// the only correct answer, and is what gRPC-Go does here as well.
+			s.finish(err)
+		}
 		return err
 	}
 
@@ -622,6 +838,12 @@ func (s *serverStream) sendMsgLocked(m interface{}) error {
 		return err
 	}
 	b := buf.Materialize()
+	// Checked here, where the message is encoded, so the limit costs no extra
+	// work. Only messages pass through this method: the trailer is written by the
+	// adapter, and is exempt for the reason given on checkSendSize.
+	if err := checkSendSize(len(b), false, s.maxSend); err != nil {
+		return err
+	}
 	frames, err := s.protocol.streamMessage(b)
 	if err != nil {
 		return err
