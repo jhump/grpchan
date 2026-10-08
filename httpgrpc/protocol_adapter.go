@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/encoding"
 	grpcproto "google.golang.org/grpc/encoding/proto"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -27,10 +28,10 @@ import (
 // operations (just POST application/json and get application/json back, for
 // example), and others like it, such as gRPC-Web and ConnectRPC.
 //
-// TODO: Implement the gRPC-Web and ConnectRPC adapters. Only the httpgrpc
-// protocol is implemented so far, which is why parts of this interface have no
-// implementation that exercises them yet: it does not compress, and it accepts
-// only POST. Those parts are noted where they appear.
+// TODO: Implement the ConnectRPC adapters. The httpgrpc and gRPC-Web protocols
+// are implemented so far, which is why parts of this interface have no
+// implementation that exercises them yet: neither accepts anything but POST.
+// Those parts are noted where they appear.
 
 // protocolAdapter contains methods used by both client and server protocols.
 type protocolAdapter interface {
@@ -241,6 +242,7 @@ var postOnly = []string{http.MethodPost}
 
 func determineProtocolAdapter(req *http.Request, w http.ResponseWriter, opts handlerOpts) protocolMatch {
 	mediaType, _, _ := mime.ParseMediaType(req.Header.Get("Content-Type"))
+	codecName, isGRPCWeb := parseGRPCWebContentType(mediaType)
 	switch {
 	case mediaType == ApplicationJson:
 		// Both connectrpc and httpgrpc protocols can use this content type.
@@ -272,9 +274,32 @@ func determineProtocolAdapter(req *http.Request, w http.ResponseWriter, opts han
 			allowStream: true,
 			methods:     postOnly,
 		}
+	case isGRPCWeb:
+		// The codec follows the plus sign, and is proto when there is none. The
+		// text variant, application/grpc-web-text, does not match here: it is not
+		// implemented.
+		return protocolMatch{
+			adapter:     newGRPCWebServerAdapter(req, w, codecName, opts),
+			subFormat:   codecName,
+			allowUnary:  true,
+			allowStream: true,
+			methods:     postOnly,
+		}
 	default:
 		return notImplementedProtocol()
 	}
+}
+
+// responseCodecName returns the name of the codec a response is labelled with,
+// given the one the request named. That is the same codec, unless none is
+// registered under its name: the RPC then fails, and since nothing in that
+// failure is encoded with the codec, the response names the default instead of
+// one the server cannot use.
+func responseCodecName(codecName string) string {
+	if encoding.GetCodecV2(codecName) == nil {
+		return grpcproto.Name
+	}
+	return codecName
 }
 
 // notImplementedProtocol leaves a content-type unclaimed.
@@ -360,6 +385,97 @@ func readSizePrefixedFrame(r io.Reader, maxRecv int) ([]byte, bool, error) {
 	return data, isTrailer, nil
 }
 
+// envelopeFlagCompressed marks a frame of the gRPC and gRPC-Web wire formats
+// whose message is compressed.
+const envelopeFlagCompressed = 0x01
+
+// envelopeFrame frames the given data the way gRPC does: a byte of flags, then
+// the length of the data as a 32-bit big-endian integer, then the data itself.
+func envelopeFrame(flags byte, data []byte) ([][]byte, error) {
+	if uint64(len(data)) > math.MaxUint32 {
+		return nil, fmt.Errorf("message too large to send: %d bytes", len(data))
+	}
+	var prefix [5]byte
+	prefix[0] = flags
+	binary.BigEndian.PutUint32(prefix[1:], uint32(len(data)))
+	return [][]byte{prefix[:], data}, nil
+}
+
+// envelopeMessage frames a message the way gRPC does, flagging it if it is
+// compressed.
+func envelopeMessage(data []byte, compressed bool) ([][]byte, error) {
+	var flags byte
+	if compressed {
+		flags |= envelopeFlagCompressed
+	}
+	return envelopeFrame(flags, data)
+}
+
+// readEnvelopeFrame reads one frame written by envelopeFrame, returning its flags
+// and data. It returns io.EOF when the stream ends cleanly between frames.
+func readEnvelopeFrame(r io.Reader, maxRecv int) (byte, []byte, error) {
+	var prefix [5]byte
+	if _, err := io.ReadFull(r, prefix[:]); err != nil {
+		// ReadFull reports io.EOF only when nothing was read, which is the clean end
+		// of a stream; a partial prefix is io.ErrUnexpectedEOF.
+		return 0, nil, err
+	}
+	size := binary.BigEndian.Uint32(prefix[1:])
+	// As with readSizePrefixedFrame: the prefix announces the size, so an
+	// over-large message is refused here, before it is read, and a bogus prefix
+	// cannot be turned into an allocation of whatever size it names.
+	if uint64(size) > uint64(maxRecv) {
+		return 0, nil, recvTooLarge("payload too large to receive: %v > %v", size, maxRecv)
+	}
+	data := make([]byte, size)
+	if _, err := io.ReadFull(r, data); err != nil {
+		if err == io.EOF {
+			// A truncated frame is not a clean end of stream.
+			err = io.ErrUnexpectedEOF
+		}
+		return 0, nil, err
+	}
+	return prefix[0], data, nil
+}
+
+// envelopeReader reads a body made of frames written by envelopeFrame, as
+// gRPC-Web's and Connect's are. Each frame is a message unless its flags mark it
+// as the body's final frame, whose payload means whatever the protocol says.
+type envelopeReader struct {
+	r io.Reader
+	// maxRecv bounds the payload of a single frame.
+	maxRecv int
+	// endFlag is the flag that marks the final frame.
+	endFlag byte
+}
+
+func newEnvelopeReader(r io.Reader, maxRecv int, endFlag byte) *envelopeReader {
+	return &envelopeReader{r: r, maxRecv: maxRecv, endFlag: endFlag}
+}
+
+// next reads the next frame, reporting its payload, whether that is compressed,
+// and whether the frame is the final one. It returns io.EOF when the body ends
+// cleanly between frames.
+func (e *envelopeReader) next() (data []byte, compressed bool, end bool, err error) {
+	flags, data, err := readEnvelopeFrame(e.r, e.maxRecv)
+	if err != nil {
+		return nil, false, false, err
+	}
+	return data, flags&envelopeFlagCompressed != 0, flags&e.endFlag != 0, nil
+}
+
+// decompressEndFrame decompresses the payload of a body's final frame, which the
+// protocols that use envelopeReader allow to be compressed, with the same
+// encoding as the response's messages. what names the frame, for the error that
+// reports an encoding with no compressor registered.
+func decompressEndFrame(what string, data []byte, compressorName string, maxRecv int) ([]byte, error) {
+	compressor := compressorFor(compressorName)
+	if compressor == nil {
+		return nil, status.Errorf(codes.Internal, "%s is compressed with unknown encoding %q", what, compressorName)
+	}
+	return decompressLimited(compressor, data, maxRecv)
+}
+
 // sseFrame encodes the given data as a server-sent event. An empty eventType
 // produces a default "message" event, which is how response messages are sent;
 // sseTrailerEvent marks the final frame.
@@ -386,6 +502,18 @@ func writeFrames(w io.Writer, frames [][]byte) error {
 		}
 	}
 	return nil
+}
+
+// timeoutMillis returns the time remaining until the given deadline in whole
+// milliseconds, which is how the protocols here propagate a deadline. It is
+// never less than one, since a deadline that has already passed must still be
+// sent as one rather than as none at all.
+func timeoutMillis(deadline time.Time) int64 {
+	millis := int64(time.Until(deadline) / time.Millisecond)
+	if millis <= 0 {
+		millis = 1
+	}
+	return millis
 }
 
 // readerFromByteSlices returns a reader of the given slices in order, without

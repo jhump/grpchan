@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	spb "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/grpc"
@@ -46,8 +45,8 @@ type channelOptions struct {
 	codec     encoding.CodecV2
 
 	// newProtocol creates this RPC's protocol adapter. A nil value means the
-	// httpgrpc protocol, which is the only one implemented so far; it is the seam
-	// through which gRPC-Web and ConnectRPC will be selected. See newAdapter.
+	// httpgrpc protocol; WithGRPCWeb sets it, and it is how ConnectRPC will be
+	// selected too. See newAdapter.
 	//
 	// protocolCompresses says whether that protocol supports compression, which
 	// is known without creating an adapter. If it does not, no compressor is ever
@@ -103,6 +102,22 @@ func WithJSONEncoding(useJSONEncoding bool) ChannelOption {
 		// Resolved in both directions, so that a later WithJSONEncoding(false) undoes
 		// an earlier WithJSONEncoding(true) rather than leaving JSON in place.
 		return o.setCodec(name)
+	}
+}
+
+// WithGRPCWeb configures the channel to use the gRPC-Web protocol instead of this
+// package's own. Messages are encoded with the channel's codec, which is proto
+// unless WithJSONEncoding says otherwise; and the protocol supports compression,
+// which grpc.UseCompressor selects. Only the binary form of the protocol is
+// supported, not application/grpc-web-text.
+//
+// A server built with this package accepts gRPC-Web without being told to.
+//
+// If more than one option selects a protocol, the last one wins.
+func WithGRPCWeb() ChannelOption {
+	return func(o *channelOptions) error {
+		o.newProtocol, o.protocolCompresses = newGRPCWebClientAdapter, true
+		return nil
 	}
 }
 
@@ -904,12 +919,7 @@ func headersFromContext(ctx context.Context) http.Header {
 		toHeaders(md, h, "")
 	}
 	if deadline, ok := ctx.Deadline(); ok {
-		timeout := time.Until(deadline)
-		millis := int64(timeout / time.Millisecond)
-		if millis <= 0 {
-			millis = 1
-		}
-		h.Set("GRPC-Timeout", fmt.Sprintf("%dm", millis))
+		h.Set("GRPC-Timeout", grpcTimeout(deadline))
 	}
 	return h
 }

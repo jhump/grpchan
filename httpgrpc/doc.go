@@ -1,7 +1,7 @@
 // Package httpgrpc contains code for using HTTP 1.1 for GRPC calls. This is intended only
 // for environments where real GRPC is not possible or prohibitively expensive, like Google
-// App Engine. It could possibly be used to perform GRPC operations from a browser, however
-// no client implementation, other than a Go client, is provided.
+// App Engine. Since servers also speak gRPC-Web (see below), it can serve GRPC operations
+// to a browser, using any gRPC-Web client.
 //
 // For servers, RPC handlers will be invoked directly from an HTTP request, optionally
 // transiting through a server interceptor. Importantly, this does not transform the
@@ -17,6 +17,17 @@
 // to expose them all; or they can create a httpgrpc.NewServer and register services on that
 // and use that to expose the services. The httpgrpc.NewServer route is the simplest and most
 // intuitive and really supersedes the other two options.
+//
+// # Protocols
+//
+// Two protocols are spoken. The first is this package's own, described in detail below,
+// and is what a Channel uses unless told otherwise. The second is gRPC-Web, which a
+// Channel uses when created with the WithGRPCWeb option. Servers accept both, telling
+// them apart by the request's Content-Type, so a server needs no configuration to serve
+// either. Only the binary form of gRPC-Web is supported, not application/grpc-web-text.
+//
+// Compression is available only with gRPC-Web, since this package's own protocol has no
+// way to express it.
 //
 // # Caveats
 //

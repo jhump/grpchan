@@ -2,7 +2,7 @@ export PATH := $(shell pwd)/.tmp/protoc/bin:$(PATH)
 export PROTOC_VERSION := 22.0
 
 .PHONY: ci
-ci: deps checkgofmt vet staticcheck ineffassign predeclared test
+ci: deps checkgofmt vet vet32 staticcheck ineffassign predeclared test
 
 .PHONY: deps
 deps:
@@ -36,6 +36,12 @@ generate: .tmp/protoc/bin/protoc
 vet:
 	go vet ./...
 
+# A 32-bit build catches size arithmetic that only overflows where int is 32
+# bits, which nothing else here would notice.
+.PHONY: vet32
+vet32:
+	GOOS=linux GOARCH=386 go vet ./...
+
 .PHONY: staticcheck
 staticcheck:
 	@go install honnef.co/go/tools/cmd/staticcheck@2025.1.1
@@ -63,9 +69,12 @@ errcheck:
 	@go install github.com/kisielk/errcheck@v1.2.0
 	errcheck ./...
 
+# The interop tests are a separate module, so that the implementations they test
+# against are not dependencies of this one.
 .PHONY: test
 test:
 	go test -race ./...
+	cd internal/interop && go test -race ./...
 
 .tmp/protoc/bin/protoc: ./Makefile ./download_protoc.sh
 	./download_protoc.sh
