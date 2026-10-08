@@ -48,11 +48,19 @@ type channelOptions struct {
 	// newProtocol creates this RPC's protocol adapter. A nil value means the
 	// httpgrpc protocol, which is the only one implemented so far; it is the seam
 	// through which gRPC-Web and ConnectRPC will be selected. See newAdapter.
-	newProtocol clientProtocolAdapterFactory
+	//
+	// protocolCompresses says whether that protocol supports compression, which
+	// is known without creating an adapter. If it does not, no compressor is ever
+	// named to the adapter, and a channel configured to compress is refused when
+	// it is created. The httpgrpc protocol has no compression.
+	newProtocol        clientProtocolAdapterFactory
+	protocolCompresses bool
 
 	// defaultCallOpts are applied to every call, ahead of the call's own options;
-	// see WithDefaultCallOptions.
-	defaultCallOpts []grpc.CallOption
+	// see WithDefaultCallOptions. defaultCompressor is the compressor they name,
+	// which NewChannel has checked can be used.
+	defaultCallOpts   []grpc.CallOption
+	defaultCompressor string
 }
 
 func (o *channelOptions) setCodec(name string) error {
@@ -105,7 +113,8 @@ func WithJSONEncoding(useJSONEncoding bool) ChannelOption {
 //
 // Only the call options this package understands have any effect, here as on a
 // single call: grpc.Header, grpc.Trailer, grpc.Peer, grpc.PerRPCCredentials,
-// grpc.MaxCallRecvMsgSize and grpc.MaxCallSendMsgSize. Others are ignored.
+// grpc.MaxCallRecvMsgSize, grpc.MaxCallSendMsgSize and grpc.UseCompressor.
+// Others are ignored.
 func WithDefaultCallOptions(opts ...grpc.CallOption) ChannelOption {
 	return func(o *channelOptions) error {
 		o.defaultCallOpts = append(o.defaultCallOpts, opts...)
@@ -140,6 +149,16 @@ func NewChannel(baseURL *url.URL, transport http.RoundTripper, opts ...ChannelOp
 		if err := opt(&chOpts); err != nil {
 			return nil, err
 		}
+	}
+	// A compressor among the default call options is checked here, where a bad one
+	// can be reported, rather than ignored on every call the way one given to a
+	// single call has to be; see requestCompressor.
+	name := internal.GetCallOptions(chOpts.defaultCallOpts).Compressor
+	if err := checkDefaultCompressor(name, chOpts.protocolCompresses); err != nil {
+		return nil, err
+	}
+	if !isIdentity(name) {
+		chOpts.defaultCompressor = name
 	}
 	return &Channel{
 		BaseURL:   baseURL,
@@ -205,10 +224,7 @@ func (ch *Channel) Invoke(ctx context.Context, methodName string, req, resp inte
 	if err != nil {
 		return err
 	}
-	h, err := protocol.requestHeaders(ctx, false)
-	if err != nil {
-		return err
-	}
+	compressName, accept := chOpts.compression(copts)
 
 	msgBuf, err := chOpts.codec.Marshal(req)
 	if err != nil {
@@ -219,8 +235,22 @@ func (ch *Channel) Invoke(ctx context.Context, methodName string, req, resp inte
 	if len(b) > maxSend {
 		return status.Errorf(codes.ResourceExhausted, "request payload too large to send: %v > %v", len(b), maxSend)
 	}
+	b, compressed, err := compressMessage(compressorFor(compressName), b, defaultCompressMinBytes)
+	if err != nil {
+		return status.Errorf(codes.Internal, "could not compress request: %v", err)
+	}
+	if !compressed {
+		// Nothing was compressed after all, so the request must not claim to be.
+		compressName = ""
+	}
+	// The headers come after the message is compressed, since whether it was is
+	// part of what they say.
+	h, err := protocol.requestHeaders(ctx, false, compressName, accept)
+	if err != nil {
+		return err
+	}
 
-	body, err := protocol.unaryMessage(b)
+	body, err := protocol.unaryMessage(b, compressed)
 	if err != nil {
 		return err
 	}
@@ -262,8 +292,24 @@ func (ch *Channel) Invoke(ctx context.Context, methodName string, req, resp inte
 	if respErr != nil {
 		return respErr
 	}
+	b = result.message
+	// NB: decompress with the compressor the *response* named, not the one used
+	// for the request.
+	compressor, err := lookupCompressor(result.compressorName)
+	if err != nil {
+		return err
+	}
+	if compressor != nil {
+		// The adapter measured the message against the limit as it was read,
+		// compressed: the limit bounds what a peer can make this process read, and
+		// those are the bytes it read. What they decode to is bounded here.
+		b, err = decompressLimited(compressor, b, maxRecv)
+		if err != nil {
+			return err
+		}
+	}
 
-	return chOpts.codec.Unmarshal(mem.BufferSlice{mem.SliceBuffer(result.message)}, resp)
+	return chOpts.codec.Unmarshal(mem.BufferSlice{mem.SliceBuffer(b)}, resp)
 }
 
 // NewStream satisfies the grpchan.Channel interface and supports sending
@@ -283,14 +329,16 @@ func (ch *Channel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodN
 		return nil, err
 	}
 	// The adapter is given the limit because deframing is where it applies.
-	protocol, err := chOpts.newAdapter(limitOrDefault(copts.MaxRecv, defaultMaxRecv))
+	maxRecv := limitOrDefault(copts.MaxRecv, defaultMaxRecv)
+	protocol, err := chOpts.newAdapter(maxRecv)
 	if err != nil {
 		return nil, err
 	}
+	compressName, accept := chOpts.compression(copts)
 
 	ctx, cancel := context.WithCancel(ctx)
 
-	h, err := protocol.requestHeaders(ctx, true)
+	h, err := protocol.requestHeaders(ctx, true, compressName, accept)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -313,6 +361,8 @@ func (ch *Channel) NewStream(ctx context.Context, desc *grpc.StreamDesc, methodN
 		protocol:   protocol,
 		codec:      chOpts.codec,
 		maxSend:    limitOrDefault(copts.MaxSend, defaultMaxSend),
+		maxRecv:    maxRecv,
+		compressor: compressorFor(compressName),
 		w:          w,
 		respStream: desc.ServerStreams,
 		rCh:        make(chan []byte),
@@ -422,10 +472,14 @@ type clientStream struct {
 
 	protocol clientProtocolAdapter
 	codec    encoding.CodecV2
-	// maxSend bounds a single request message. The receive limit has no counterpart
-	// here: it belongs to the adapter, which is what deframes a response and so can
-	// refuse an over-large message before reading it.
+	// maxSend bounds a single request message. The receive limit belongs to the
+	// adapter, which is what deframes a response and so can refuse an over-large
+	// message before reading it, but a compressed message is bounded again once
+	// decompressed, which needs the limit here as well.
 	maxSend int
+	maxRecv int
+	// compressor compresses the messages sent, and is nil if they are not.
+	compressor encoding.Compressor
 
 	// respStream is set to indicate whether client expects stream response; unary if false
 	respStream bool
@@ -699,7 +753,14 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 		cs.copts.SetPeer(getPeer(cs.baseUrl, reply.TLS))
 	}
 
-	md, err := cs.protocol.processStreamHeaders(reply)
+	md, respCompressName, err := cs.protocol.processStreamHeaders(reply)
+	if err != nil {
+		onReady(err, md)
+		return
+	}
+	// NB: response messages are decompressed with the compressor the *response*
+	// named, not the one used for the request.
+	respCompressor, err := lookupCompressor(respCompressName)
 	if err != nil {
 		onReady(err, md)
 		return
@@ -707,7 +768,7 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 	onReady(nil, md)
 
 	for {
-		data, trailers, err := cs.protocol.readStreamResponse()
+		data, compressed, trailers, err := cs.protocol.readStreamResponse()
 		if err != nil {
 			// End of stream: err is io.EOF if it completed successfully, otherwise
 			// the RPC's failure status. Either way the adapter has given us the
@@ -730,6 +791,21 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 			rErr = err
 			return
 		}
+		if compressed {
+			if respCompressor == nil {
+				rErr = status.Error(codes.Internal, "server sent a compressed message without naming a compressor")
+				return
+			}
+			data, err = decompressLimited(respCompressor, data, cs.maxRecv)
+			if err != nil {
+				if isLimitError(err) {
+					// As for a message refused before it was read: gRPC-Go ends the RPC.
+					cancelOnDone = true
+				}
+				rErr = err
+				return
+			}
+		}
 
 		select {
 		case <-cs.ctx.Done():
@@ -740,6 +816,16 @@ func (cs *clientStream) doHttpCall(transport http.RoundTripper, req *http.Reques
 		case cs.rCh <- data:
 		}
 	}
+}
+
+// compression returns the compressor a call's messages are sent with ("" for
+// none) and the encodings a response may use. Both are empty when the protocol
+// does not support compression.
+func (o channelOptions) compression(copts *internal.CallOptions) (string, []string) {
+	if !o.protocolCompresses {
+		return "", nil
+	}
+	return requestCompressor(copts.Compressor, o.defaultCompressor, true), advertisedCompressors()
 }
 
 // newAdapter creates the protocol adapter for a single RPC. Adapters are per-RPC
@@ -760,7 +846,11 @@ func (cs *clientStream) sendMsgLocked(m interface{}) error {
 	if err := checkSendSize(len(data), false, cs.maxSend); err != nil {
 		return err
 	}
-	frames, err := cs.protocol.streamMessage(data)
+	data, compressed, err := compressMessage(cs.compressor, data, defaultCompressMinBytes)
+	if err != nil {
+		return status.Errorf(codes.Internal, "could not compress message: %v", err)
+	}
+	frames, err := cs.protocol.streamMessage(data, compressed)
 	if err != nil {
 		return err
 	}

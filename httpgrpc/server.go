@@ -151,6 +151,10 @@ type handlerOpts struct {
 	// and sendLimit so that the defaults apply either way.
 	maxRecv int
 	maxSend int
+	// compressMinBytes is meaningful only when compressMinSet is, since zero is a
+	// valid minimum: it means every message is compressed.
+	compressMinBytes int
+	compressMinSet   bool
 }
 
 // recvLimit returns the largest request message the handler will accept.
@@ -161,6 +165,14 @@ func (h *handlerOpts) recvLimit() int {
 // sendLimit returns the largest response message the handler will produce.
 func (h *handlerOpts) sendLimit() int {
 	return limitOrDefault(h.maxSend, defaultMaxSend)
+}
+
+// compressMin returns the smallest response message the handler will compress.
+func (h *handlerOpts) compressMin() int {
+	if !h.compressMinSet {
+		return defaultCompressMinBytes
+	}
+	return h.compressMinBytes
 }
 
 // ErrorRenderer returns a HandlerOption that will cause the handler to use the
@@ -200,6 +212,20 @@ func WithMaxRecvMsgSize(limit int) HandlerOption {
 func WithMaxSendMsgSize(limit int) HandlerOption {
 	return func(h *handlerOpts) {
 		h.maxSend = limit
+	}
+}
+
+// WithCompressMinBytes returns a HandlerOption that sets the smallest response
+// message the handler will compress. A smaller message is sent uncompressed even
+// when the client accepts a compressed one, since compressing it costs CPU and
+// saves little or nothing on the wire. Zero means every message is compressed.
+//
+// If no such option is used, the minimum is 1kb. That only matters for protocols
+// that support compression, which this package's own protocol does not.
+func WithCompressMinBytes(minBytes int) HandlerOption {
+	return func(h *handlerOpts) {
+		h.compressMinBytes = minBytes
+		h.compressMinSet = true
 	}
 }
 
@@ -318,8 +344,10 @@ func handleMethod(svr interface{}, serviceName string, desc *grpc.MethodDesc, un
 		// The adapter refuses a request message over the limit, since only it can
 		// tell how much of the body is message: it refuses one that announces itself
 		// as too large without reading it, and reads one that does not through a
-		// limit.
-		req, err := protocol.processUnaryRequest()
+		// limit. A compressed message is measured against the same limit, since the
+		// limit bounds what a peer can make this process read; what it decompresses
+		// to is bounded by decompressLimited below.
+		req, compressed, err := protocol.processUnaryRequest()
 		if err != nil {
 			refused = isLimitError(err)
 			if _, ok := status.FromError(err); !ok {
@@ -328,6 +356,22 @@ func handleMethod(svr interface{}, serviceName string, desc *grpc.MethodDesc, un
 			}
 			fail(err)
 			return
+		}
+		if compressed {
+			if call.reqCompressor == nil {
+				fail(status.Error(codes.Internal, "request message is compressed but names no compressor"))
+				return
+			}
+			// The body is read before it is decompressed, rather than the decompressor
+			// pulling from it, so that the compressed bytes are subject to the limit
+			// too: a stream cut short at the limit is indistinguishable, to a
+			// decompressor, from a corrupt one, and would be reported as such.
+			req, err = decompressLimited(call.reqCompressor, req, opts.recvLimit())
+			if err != nil {
+				refused = isLimitError(err)
+				fail(err)
+				return
+			}
 		}
 
 		dec := func(msg interface{}) error {
@@ -358,11 +402,22 @@ func handleMethod(svr interface{}, serviceName string, desc *grpc.MethodDesc, un
 				"response payload too large to send: %v > %v", len(b), maxSend))
 			return
 		}
+		respCompressName := call.respCompressName
+		b, respCompressed, err := compressMessage(compressorFor(respCompressName), b, opts.compressMin())
+		if err != nil {
+			fail(status.Errorf(codes.Internal, "could not compress response: %v", err))
+			return
+		}
+		if !respCompressed {
+			// Nothing was compressed after all, so the response must not claim to be.
+			respCompressName = ""
+		}
 
 		protocol.writeUnary(ctx, unaryReply{
-			headers:  sts.GetHeaders(),
-			message:  b,
-			trailers: sts.GetTrailers(),
+			headers:        sts.GetHeaders(),
+			message:        b,
+			compressorName: respCompressName,
+			trailers:       sts.GetTrailers(),
 		})
 	}
 }
@@ -415,17 +470,22 @@ func handleStream(svr interface{}, serviceName string, desc *grpc.StreamDesc, st
 		_ = http.NewResponseController(w).EnableFullDuplex()
 
 		if err != nil {
-			call.protocol.sendStreamHeaders(nil)
+			call.protocol.sendStreamHeaders("", nil)
 			call.protocol.finishStream(errorStatus(err), nil)
 			return
 		}
 
 		str = &serverStream{
-			protocol:  call.protocol,
-			codec:     call.codec,
-			maxSend:   opts.sendLimit(),
-			w:         w,
-			reqStream: desc.ClientStreams,
+			protocol:         call.protocol,
+			codec:            call.codec,
+			maxSend:          opts.sendLimit(),
+			maxRecv:          opts.recvLimit(),
+			reqCompressor:    call.reqCompressor,
+			respCompressName: call.respCompressName,
+			respCompressor:   compressorFor(call.respCompressName),
+			compressMin:      opts.compressMin(),
+			w:                w,
+			reqStream:        desc.ClientStreams,
 		}
 		sts := internal.ServerTransportStream{Name: info.FullMethod, Stream: str}
 		str.ctx = grpc.NewContextWithServerTransportStream(call.ctx, &sts)
@@ -443,14 +503,20 @@ func handleStream(svr interface{}, serviceName string, desc *grpc.StreamDesc, st
 }
 
 // serverCall is what serving a request involves before it matters whether the
-// method is unary or streaming: the protocol the request is in, the codec its
-// messages use, and the context it is served in.
+// method is unary or streaming: the protocol the request is in, the codec and
+// compression its messages use, and the context it is served in.
 type serverCall struct {
 	protocol serverProtocolAdapter
 	codec    encoding.CodecV2
 	ctx      context.Context
 	// cancel releases the deadline the client asked for, if any. It is never nil.
 	cancel context.CancelFunc
+	// reqCompressor decompresses the request messages that are compressed, and is
+	// nil if the request named no compressor. respCompressName is the compressor
+	// for response messages, chosen from those the client accepts, and is empty
+	// if they are not compressed.
+	reqCompressor    encoding.Compressor
+	respCompressName string
 }
 
 // beginCall matches a request to a protocol and checks that the method can be
@@ -501,6 +567,12 @@ func beginCall(w http.ResponseWriter, r *http.Request, opts *handlerOpts, isStre
 	if reqInfo.hasTimeout {
 		call.ctx, call.cancel = context.WithTimeout(call.ctx, reqInfo.timeout)
 	}
+
+	call.reqCompressor, err = lookupCompressor(reqInfo.compressorName)
+	if err != nil {
+		return call, status.Errorf(codes.Unimplemented, "unsupported request encoding: %v", reqInfo.compressorName)
+	}
+	call.respCompressName = responseCompressor(reqInfo.compressorName, reqInfo.acceptCompressors)
 	return call, nil
 }
 
@@ -577,10 +649,20 @@ type serverStream struct {
 	ctx      context.Context
 	protocol serverProtocolAdapter
 	codec    encoding.CodecV2
-	// maxSend bounds a single response message. The receive limit has no
-	// counterpart here: it belongs to the adapter, which is what deframes a request
-	// and so can refuse an over-large message before reading it.
+	// maxSend bounds a single response message. The receive limit belongs to the
+	// adapter, which is what deframes a request and so can refuse an over-large
+	// message before reading it, but a compressed message is bounded again once
+	// decompressed, which needs the limit here as well.
 	maxSend int
+	maxRecv int
+	// reqCompressor decompresses the request messages that are compressed, and is
+	// nil if the request named no compressor. respCompressor compresses response
+	// messages of at least compressMin bytes, and is nil if they are not
+	// compressed; respCompressName is its name, for the response headers.
+	reqCompressor    encoding.Compressor
+	respCompressor   encoding.Compressor
+	respCompressName string
+	compressMin      int
 	// reqStream indicates whether the client may send more than one message.
 	reqStream bool
 
@@ -812,7 +894,7 @@ func (s *serverStream) RecvMsg(m interface{}) error {
 	}
 
 	if !s.reqStream {
-		if _, err := s.protocol.readStreamRequest(); err != io.EOF {
+		if _, _, err := s.protocol.readStreamRequest(); err != io.EOF {
 			// client tried to send >1 message!
 			return status.Error(codes.InvalidArgument, "method accepts 1 request message but client sent >1")
 		}
@@ -829,7 +911,7 @@ func (s *serverStream) sendHeadersLocked() {
 		return
 	}
 	s.headersSent = true
-	s.protocol.sendStreamHeaders(metadata.Join(s.hd...))
+	s.protocol.sendStreamHeaders(s.respCompressName, metadata.Join(s.hd...))
 }
 
 func (s *serverStream) sendMsgLocked(m interface{}) error {
@@ -844,7 +926,11 @@ func (s *serverStream) sendMsgLocked(m interface{}) error {
 	if err := checkSendSize(len(b), false, s.maxSend); err != nil {
 		return err
 	}
-	frames, err := s.protocol.streamMessage(b)
+	b, compressed, err := compressMessage(s.respCompressor, b, s.compressMin)
+	if err != nil {
+		return status.Errorf(codes.Internal, "could not compress message: %v", err)
+	}
+	frames, err := s.protocol.streamMessage(b, compressed)
 	if err != nil {
 		return err
 	}
@@ -859,9 +945,20 @@ func (s *serverStream) sendMsgLocked(m interface{}) error {
 }
 
 func (s *serverStream) recvMsgLocked(m interface{}) error {
-	data, err := s.protocol.readStreamRequest()
+	data, compressed, err := s.protocol.readStreamRequest()
 	if err != nil {
 		return err
+	}
+	if compressed {
+		if s.reqCompressor == nil {
+			return status.Error(codes.Internal, "request message is compressed but names no compressor")
+		}
+		// A message refused here ends the stream, as one refused before it was read
+		// does; see RecvMsg.
+		data, err = decompressLimited(s.reqCompressor, data, s.maxRecv)
+		if err != nil {
+			return err
+		}
 	}
 	return s.codec.Unmarshal(mem.BufferSlice{mem.SliceBuffer(data)}, m)
 }

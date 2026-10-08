@@ -29,21 +29,20 @@ import (
 //
 // TODO: Implement the gRPC-Web and ConnectRPC adapters. Only the httpgrpc
 // protocol is implemented so far, which is why parts of this interface have no
-// implementation that exercises them yet: it accepts only POST. Those parts are
-// noted where they appear. Both of those protocols also support compression,
-// which httpgrpc does not, so this interface will grow to carry it when the
-// first of them is added.
+// implementation that exercises them yet: it does not compress, and it accepts
+// only POST. Those parts are noted where they appear.
 
 // protocolAdapter contains methods used by both client and server protocols.
 type protocolAdapter interface {
 	// streamMessage encodes the given message into a "frame" for the protocol. The
-	// given parameter is the encoded message bytes. The response is the framed
-	// data, as a sequence of slices to be written in order, or an error.
+	// given parameters are the encoded message bytes and a flag indicating whether
+	// the bytes are compressed. The response is the framed data, as a sequence of
+	// slices to be written in order, or an error.
 	//
 	// This method is called if the RPC is not a unary operation. So, even if a
 	// single direction is unary (for example, in a client streaming operation, the
 	// server response is unary) this method is used for both requests and responses.
-	streamMessage(data []byte) ([][]byte, error)
+	streamMessage(data []byte, compressed bool) ([][]byte, error)
 }
 
 // clientProtocolAdapterFactory creates a clientProtocolAdapter for a single RPC,
@@ -72,19 +71,25 @@ type clientProtocolAdapterFactory func(codecName string, maxRecv int) (clientPro
 type clientProtocolAdapter interface {
 	protocolAdapter
 	// unaryMessage encodes the given message into the frames of a unary request
-	// body. The given parameter is the encoded message bytes.
+	// body. The given parameters are the encoded message bytes and a flag
+	// indicating whether the bytes are compressed.
 	//
 	// This is separate from streamMessage since some protocols frame unary bodies
 	// differently from streaming ones. It is only used for unary operations.
 	//
 	// There is no server-side counterpart: a server hands its response message to
 	// writeUnary instead, because the adapter owns the response writer.
-	unaryMessage(data []byte) ([][]byte, error)
+	unaryMessage(data []byte, compressed bool) ([][]byte, error)
 	// requestHeaders creates the request headers for the operation. If the given
 	// context has a deadline, it may be encoded in request headers to propagate that
 	// deadline. This method need not encode any custom metadata, only headers needed
 	// by the protocol to define the call.
-	requestHeaders(ctx context.Context, isStream bool) (http.Header, error)
+	//
+	// The compressorName is the encoding of the request messages, and is empty
+	// when they are not compressed. The acceptCompressors are the encodings the
+	// response may use, in order of preference. Both are empty for a protocol that
+	// does not support compression; see channelOptions.protocolCompresses.
+	requestHeaders(ctx context.Context, isStream bool, compressorName string, acceptCompressors []string) (http.Header, error)
 	// processUnaryResponse reads the given response, body included, and returns all
 	// aspects of the RPC result. The error should be non-nil if the call indicates a
 	// non-OK RPC status code, or if the response is not one the adapter can use,
@@ -95,23 +100,25 @@ type clientProtocolAdapter interface {
 	// Reading the body may block for as long as the server takes to send it, so the
 	// driver calls this where it can stop waiting when the RPC's context ends.
 	processUnaryResponse(resp *http.Response) (unaryResponse, error)
-	// processStreamHeaders processes the given stream response into header metadata and
-	// an optional error indicating whether the RPC already failed. This is only called for
+	// processStreamHeaders processes the given stream response into header metadata,
+	// the compressor that compressed response messages use (empty if none), and an
+	// optional error indicating whether the RPC already failed. This is only called for
 	// stream operations, and will be combined with calls to readStreamResponse.
 	//
 	// The adapter also takes ownership of the response body here, which is what
 	// subsequent calls to readStreamResponse read from. It is captured once, at this
 	// point, because deframing may be stateful and so cannot re-wrap the body on
 	// every message.
-	processStreamHeaders(resp *http.Response) (metadata.MD, error)
+	processStreamHeaders(resp *http.Response) (md metadata.MD, compressorName string, err error)
 	// readStreamResponse reads the next response message from the body captured by
 	// processStreamHeaders, which must have been called first. The returned data
-	// should be the encoded response message. If an error occurs or if the end of
-	// the stream has been reached, the returned data should be nil and the given
-	// metadata and error should be populated as trailer metadata and the cause of
-	// failure. If the RPC operation completed successfully, the error returned
+	// should be the encoded (and optionally compressed) response message, and the
+	// returned flag indicates whether it is compressed. If an error occurs or if the
+	// end of the stream has been reached, the returned data should be nil and the
+	// given metadata and error should be populated as trailer metadata and the cause
+	// of failure. If the RPC operation completed successfully, the error returned
 	// should be io.EOF.
-	readStreamResponse() ([]byte, metadata.MD, error)
+	readStreamResponse() ([]byte, bool, metadata.MD, error)
 }
 
 // unaryResponse is the result of a unary RPC, as processUnaryResponse reads it
@@ -120,7 +127,10 @@ type unaryResponse struct {
 	headers  metadata.MD
 	trailers metadata.MD
 	// message is the encoded response message, which is nil if the RPC failed.
-	message []byte
+	// compressorName is the encoding it is compressed with, and is empty if it is
+	// not compressed.
+	message        []byte
+	compressorName string
 }
 
 // serverProtocolAdapter provides the methods needed to implement the server side of
@@ -140,30 +150,32 @@ type serverProtocolAdapter interface {
 	// RPC is served in.
 	processHeaders(header http.Header) (requestInfo, error)
 	// processUnaryRequest reads the request message from the request the adapter
-	// was created with. It returns the encoded message, or an error.
+	// was created with. It returns the encoded message and a flag indicating
+	// whether it is compressed, or an error.
 	//
 	// The body is not passed in, because it is not always where the message is: the
 	// connect protocol can carry a unary request in the query string of a GET, for
 	// idempotent calls. An adapter that accepts such a request reads it from there
 	// instead.
-	processUnaryRequest() ([]byte, error)
+	processUnaryRequest() ([]byte, bool, error)
 	// writeUnary writes the whole response of a unary RPC. It is called exactly
 	// once, and is all that is written for a unary RPC, whether it succeeded or
 	// failed.
 	writeUnary(ctx context.Context, reply unaryReply)
 	// sendStreamHeaders writes the response headers of a streaming RPC, which
-	// carry the given header metadata, and commits the HTTP status. It is called
-	// once, before anything is written to the body. The stream's outcome is
-	// reported later, by finishStream.
-	sendStreamHeaders(md metadata.MD)
+	// carry the given compression encoding (empty if none) and header metadata,
+	// and commits the HTTP status. It is called once, before anything is written to
+	// the body. The stream's outcome is reported later, by finishStream.
+	sendStreamHeaders(compressorName string, md metadata.MD)
 	// readStreamRequest extracts the next message from the request body, which the
 	// adapter took ownership of when it was created. It returns the encoded message
-	// data. It returns io.EOF once the client has closed the stream.
+	// data and a flag indicating whether it is compressed. It returns io.EOF once
+	// the client has closed the stream.
 	//
 	// The body is not passed in, for the same reason it is not passed to
 	// readStreamResponse: deframing may be stateful, so it cannot re-wrap the body
 	// on every message.
-	readStreamRequest() ([]byte, error)
+	readStreamRequest() ([]byte, bool, error)
 	// finishStream records the given status, which is nil on successful completion
 	// and otherwise never OK. The protocols supported here all encode the final
 	// status and trailing metadata into the response body, as a final frame, so this
@@ -180,14 +192,21 @@ type requestInfo struct {
 	// set.
 	timeout    time.Duration
 	hasTimeout bool
+	// compressorName is the encoding of the request messages, and is empty if
+	// they are not compressed. acceptCompressors are the encodings the client
+	// accepts for the response, in order of preference.
+	compressorName    string
+	acceptCompressors []string
 }
 
 // unaryReply is the whole response of a unary RPC, as given to writeUnary.
 type unaryReply struct {
 	headers metadata.MD
 	// message is the encoded response message. It is only set when the RPC
-	// succeeded.
-	message []byte
+	// succeeded. compressorName is the encoding it is compressed with, and is
+	// empty if it is not compressed.
+	message        []byte
+	compressorName string
 	// status is nil when the RPC succeeded, and otherwise is never OK; see
 	// errorStatus.
 	status   *status.Status

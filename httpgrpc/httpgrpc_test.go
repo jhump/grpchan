@@ -20,6 +20,8 @@ import (
 	"github.com/fullstorydev/grpchan/httpgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/encoding"
+	"google.golang.org/grpc/encoding/gzip"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -248,6 +250,42 @@ func TestNewChannelValidation(t *testing.T) {
 			t.Fatal("channel was not configured with what it was given")
 		}
 	})
+	t.Run("unknown default compressor is refused", func(t *testing.T) {
+		_, err := httpgrpc.NewChannel(u, http.DefaultTransport,
+			httpgrpc.WithDefaultCallOptions(grpc.UseCompressor("no-such-compressor")))
+		if err == nil {
+			t.Fatal("expected an error for an unregistered compressor")
+		}
+	})
+	t.Run("default compressor the protocol cannot use is refused", func(t *testing.T) {
+		// gzip is registered, but the httpgrpc protocol does not support compression.
+		_, err := httpgrpc.NewChannel(u, http.DefaultTransport,
+			httpgrpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name)))
+		if err == nil {
+			t.Fatal("expected an error for a protocol that cannot compress")
+		}
+	})
+	t.Run("identity default compressor is accepted", func(t *testing.T) {
+		_, err := httpgrpc.NewChannel(u, http.DefaultTransport,
+			httpgrpc.WithDefaultCallOptions(grpc.UseCompressor(encoding.Identity)))
+		if err != nil {
+			t.Fatalf("failed to create channel: %v", err)
+		}
+	})
+}
+
+// TestCallCompressorIgnored checks that a compressor given to a single call is
+// ignored when it cannot be used, rather than failing the call: this package has
+// always ignored grpc.UseCompressor, so existing callers may pass one.
+func TestCallCompressorIgnored(t *testing.T) {
+	cli := grpchantesting.NewTestServiceClient(newChannel(t, serverURL(t)))
+	ctx := context.Background()
+	msg := &grpchantesting.Message{Payload: []byte("hello")}
+	for _, name := range []string{"no-such-compressor", gzip.Name} {
+		if _, err := cli.Unary(ctx, msg, grpc.UseCompressor(name)); err != nil {
+			t.Errorf("unary with compressor %q failed: %v", name, err)
+		}
+	}
 }
 
 // TestChannelMissingFields covers the checks that cannot be made by

@@ -29,6 +29,9 @@ type CallOptions struct {
 	// MaxSend is the maximum number of bytes to send for a single message in
 	// a call.
 	MaxSend int
+	// Compressor names the compressor to use for the messages a call sends, if
+	// the protocol in use supports compression.
+	Compressor string
 }
 
 // SetHeaders sets all accumulated header addresses to the given metadata. This
@@ -73,6 +76,8 @@ func GetCallOptions(opts []grpc.CallOption) *CallOptions {
 			copts.MaxRecv = o.MaxRecvMsgSize
 		case grpc.MaxSendMsgSizeCallOption:
 			copts.MaxSend = o.MaxSendMsgSize
+		case grpc.CompressorCallOption:
+			copts.Compressor = o.CompressorType
 		}
 	}
 	return &copts

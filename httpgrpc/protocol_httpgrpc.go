@@ -67,7 +67,7 @@ func (h *httpGRPCClientProtocolAdapter) isJSON() bool {
 	return h.codecName == jsonCodecName
 }
 
-func (h *httpGRPCClientProtocolAdapter) unaryMessage(data []byte) ([][]byte, error) {
+func (h *httpGRPCClientProtocolAdapter) unaryMessage(data []byte, _ bool) ([][]byte, error) {
 	return [][]byte{data}, nil
 }
 
@@ -75,14 +75,16 @@ func (h *httpGRPCClientProtocolAdapter) unaryMessage(data []byte) ([][]byte, err
 // stream's request body is just a sequence of JSON values, which are
 // self-delimiting, so the message data is sent as-is. (Server-sent events appear
 // only in the other direction; see the server adapter.)
-func (h *httpGRPCClientProtocolAdapter) streamMessage(data []byte) ([][]byte, error) {
+func (h *httpGRPCClientProtocolAdapter) streamMessage(data []byte, _ bool) ([][]byte, error) {
 	if h.isJSON() {
 		return [][]byte{data}, nil
 	}
 	return sizePrefixedFrame(data, false)
 }
 
-func (h *httpGRPCClientProtocolAdapter) requestHeaders(ctx context.Context, isStream bool) (http.Header, error) {
+// requestHeaders ignores compression, which this protocol does not have, and so
+// is never asked to use.
+func (h *httpGRPCClientProtocolAdapter) requestHeaders(ctx context.Context, isStream bool, _ string, _ []string) (http.Header, error) {
 	var contentType, acceptType string
 	switch {
 	case h.isJSON():
@@ -146,6 +148,7 @@ func (h *httpGRPCClientProtocolAdapter) processUnaryResponse(resp *http.Response
 
 	// The body is the whole message in this protocol, so a declared length is the
 	// message's size, and one over the limit is refused without reading any of it.
+	// This protocol has no compression, so the message never is.
 	result.message, err = readBodyLimited(resp.Body, resp.ContentLength, h.maxRecv)
 	if err != nil {
 		return result, err
@@ -166,10 +169,10 @@ func httpGRPCUnaryCodec(mediaType string) (string, bool) {
 	}
 }
 
-func (h *httpGRPCClientProtocolAdapter) processStreamHeaders(resp *http.Response) (metadata.MD, error) {
+func (h *httpGRPCClientProtocolAdapter) processStreamHeaders(resp *http.Response) (metadata.MD, string, error) {
 	md, err := asMetadata(resp.Header)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// Take ownership of the body; readStreamResponse reads successive messages
 	// from it. When the server replies with server-sent events, deframing needs a
@@ -183,12 +186,13 @@ func (h *httpGRPCClientProtocolAdapter) processStreamHeaders(resp *http.Response
 		h.sseDec = sse.NewDecoderWithMaxData(resp.Body, h.maxRecv)
 	}
 	stat := statFromResponse(resp, h.codec)
-	return md, stat.Err()
+	// This protocol has no compression, so response messages never are.
+	return md, "", stat.Err()
 }
 
-func (h *httpGRPCClientProtocolAdapter) readStreamResponse() ([]byte, metadata.MD, error) {
+func (h *httpGRPCClientProtocolAdapter) readStreamResponse() ([]byte, bool, metadata.MD, error) {
 	if h.respBody == nil {
-		return nil, nil, fmt.Errorf("readStreamResponse called before processStreamHeaders")
+		return nil, false, nil, fmt.Errorf("readStreamResponse called before processStreamHeaders")
 	}
 	data, isTrailer, err := h.readStreamFrame()
 	if err != nil {
@@ -198,16 +202,16 @@ func (h *httpGRPCClientProtocolAdapter) readStreamResponse() ([]byte, metadata.M
 			// reports when it has read that frame.
 			err = io.ErrUnexpectedEOF
 		}
-		return nil, nil, err
+		return nil, false, nil, err
 	}
 	if !isTrailer {
-		return data, nil, nil
+		return data, false, nil, nil
 	}
 
 	// The final frame carries the RPC's status and any trailing metadata.
 	var tr HttpTrailer
 	if err := h.codec.Unmarshal(mem.BufferSlice{mem.SliceBuffer(data)}, &tr); err != nil {
-		return nil, nil, err
+		return nil, false, nil, err
 	}
 	var trailers metadata.MD
 	if len(tr.Metadata) > 0 {
@@ -218,11 +222,11 @@ func (h *httpGRPCClientProtocolAdapter) readStreamResponse() ([]byte, metadata.M
 		Message: tr.Message,
 		Details: tr.Details,
 	}); err != nil {
-		return nil, trailers, err
+		return nil, false, trailers, err
 	}
 	// The stream ended successfully, which callers distinguish from a failure by
 	// the io.EOF sentinel rather than a nil error.
-	return nil, trailers, io.EOF
+	return nil, false, trailers, io.EOF
 }
 
 // readStreamFrame reads the next frame of the response body, in whichever framing
@@ -286,7 +290,7 @@ func (h *httpGRPCServerProtocolAdapter) codec() encoding.CodecV2 {
 
 // streamMessage frames a response message. Proto streams use a size prefix; JSON
 // streams are sent to the client as server-sent events.
-func (h *httpGRPCServerProtocolAdapter) streamMessage(data []byte) ([][]byte, error) {
+func (h *httpGRPCServerProtocolAdapter) streamMessage(data []byte, _ bool) ([][]byte, error) {
 	if h.isJSON() {
 		return sseFrame("", data)
 	}
@@ -294,6 +298,8 @@ func (h *httpGRPCServerProtocolAdapter) streamMessage(data []byte) ([][]byte, er
 }
 
 func (h *httpGRPCServerProtocolAdapter) processHeaders(header http.Header) (requestInfo, error) {
+	// This protocol has no compression, so there is no encoding to report in either
+	// direction, and a server never compresses its response.
 	md, err := asMetadata(header)
 	if err != nil {
 		return requestInfo{}, err
@@ -303,16 +309,18 @@ func (h *httpGRPCServerProtocolAdapter) processHeaders(header http.Header) (requ
 	return info, nil
 }
 
-func (h *httpGRPCServerProtocolAdapter) processUnaryRequest() ([]byte, error) {
+func (h *httpGRPCServerProtocolAdapter) processUnaryRequest() ([]byte, bool, error) {
 	// This protocol adds no framing to a unary body: the whole body is the message.
 	// So a declared length is the message's size, and one over the limit is refused
 	// without reading any of it.
-	return readBodyLimited(h.reqBody, h.contentLength, h.maxRecv)
+	data, err := readBodyLimited(h.reqBody, h.contentLength, h.maxRecv)
+	return data, false, err
 }
 
 // writeUnary reports the RPC's status and trailing metadata as headers, so they
 // are all set before anything is written: the first write flushes the header
-// block.
+// block. The message is never compressed, since processHeaders reports no
+// encodings the client accepts.
 func (h *httpGRPCServerProtocolAdapter) writeUnary(ctx context.Context, reply unaryReply) {
 	hdr := h.w.Header()
 	// Label the body so the client can tell how it is encoded; a client is entitled
@@ -351,7 +359,7 @@ func (h *httpGRPCServerProtocolAdapter) writeUnary(ctx context.Context, reply un
 	_, _ = h.w.Write(reply.message)
 }
 
-func (h *httpGRPCServerProtocolAdapter) sendStreamHeaders(md metadata.MD) {
+func (h *httpGRPCServerProtocolAdapter) sendStreamHeaders(_ string, md metadata.MD) {
 	hdr := h.w.Header()
 	// Label the body so the client can tell how it is framed and encoded. A JSON
 	// stream is the one case where the response Content-Type differs from the
@@ -366,7 +374,7 @@ func (h *httpGRPCServerProtocolAdapter) sendStreamHeaders(md metadata.MD) {
 	h.w.WriteHeader(http.StatusOK)
 }
 
-func (h *httpGRPCServerProtocolAdapter) readStreamRequest() ([]byte, error) {
+func (h *httpGRPCServerProtocolAdapter) readStreamRequest() ([]byte, bool, error) {
 	if h.isJSON() {
 		// A JSON request body is a sequence of JSON values. The decoder buffers, so
 		// it is created once and reused for the life of the stream. It is bounded
@@ -377,20 +385,20 @@ func (h *httpGRPCServerProtocolAdapter) readStreamRequest() ([]byte, error) {
 		}
 		msg, err := decodeJSONValue(h.jsonDec)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		return msg, nil
+		return msg, false, nil
 	}
 
 	data, isTrailer, err := readSizePrefixedFrame(h.reqBody, h.maxRecv)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if isTrailer {
 		// Clients do not send trailers in this protocol; treat it as end-of-stream.
-		return nil, io.EOF
+		return nil, false, io.EOF
 	}
-	return data, nil
+	return data, false, nil
 }
 
 // finishStream writes the final frame of the response body, which is where this
