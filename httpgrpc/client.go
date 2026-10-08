@@ -108,15 +108,34 @@ func WithJSONEncoding(useJSONEncoding bool) ChannelOption {
 // WithGRPCWeb configures the channel to use the gRPC-Web protocol instead of this
 // package's own. Messages are encoded with the channel's codec, which is proto
 // unless WithJSONEncoding says otherwise; and the protocol supports compression,
-// which grpc.UseCompressor selects. Only the binary form of the protocol is
-// supported, not application/grpc-web-text.
+// which grpc.UseCompressor selects.
 //
 // A server built with this package accepts gRPC-Web without being told to.
 //
 // If more than one option selects a protocol, the last one wins.
 func WithGRPCWeb() ChannelOption {
 	return func(o *channelOptions) error {
-		o.newProtocol, o.protocolCompresses = newGRPCWebClientAdapter, true
+		o.newProtocol = func(codecName string, maxRecv int) (clientProtocolAdapter, error) {
+			return newGRPCWebClientAdapter(codecName, maxRecv, false)
+		}
+		o.protocolCompresses = true
+		return nil
+	}
+}
+
+// WithGRPCWebText is like WithGRPCWeb, but uses the protocol's text form,
+// application/grpc-web-text, in which bodies are base64-encoded. That form exists
+// for clients that cannot handle binary bodies, such as some browsers; a Go
+// client has little reason to use it, except to talk to a server that only
+// speaks it.
+//
+// If more than one option selects a protocol, the last one wins.
+func WithGRPCWebText() ChannelOption {
+	return func(o *channelOptions) error {
+		o.newProtocol = func(codecName string, maxRecv int) (clientProtocolAdapter, error) {
+			return newGRPCWebClientAdapter(codecName, maxRecv, true)
+		}
+		o.protocolCompresses = true
 		return nil
 	}
 }

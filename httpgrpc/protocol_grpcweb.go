@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"google.golang.org/grpc/codes"
-	grpcproto "google.golang.org/grpc/encoding/proto"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -30,8 +29,8 @@ import (
 // response, which has no body and carries the status in its headers instead; a
 // server may send one for an RPC that fails before producing a message.
 //
-// Only the binary form is implemented. The text form, application/grpc-web-text,
-// base64-encodes the same frames, and is not recognized.
+// Both the binary form and the text form, which base64-encodes the same frames,
+// are implemented; see grpcweb_text.go.
 
 const (
 	grpcWebContentType = "application/grpc-web"
@@ -40,25 +39,6 @@ const (
 	// is trailing metadata in HTTP header form rather than a message.
 	grpcWebFlagTrailers = 0x80
 )
-
-// parseGRPCWebContentType reports whether the given media type is one of
-// gRPC-Web's, and if so which codec it names. A media type without a codec means
-// proto.
-func parseGRPCWebContentType(mediaType string) (codecName string, ok bool) {
-	base, codecName, found := strings.Cut(mediaType, "+")
-	if base != grpcWebContentType {
-		return "", false
-	}
-	if !found {
-		codecName = grpcproto.Name
-	}
-	return codecName, true
-}
-
-// grpcWebContentTypeFor returns the content-type naming the given message codec.
-func grpcWebContentTypeFor(codecName string) string {
-	return grpcWebContentType + "+" + codecName
-}
 
 // grpcWebTrailers renders the final frame's payload: the RPC's status, which is
 // nil for success, and any trailing metadata, in the same form as a block of HTTP
@@ -110,22 +90,33 @@ type grpcWebServerProtocolAdapter struct {
 	// codecName is the message format the response is labelled with; see
 	// responseCodecName.
 	codecName string
-	reqBody   *envelopeReader
-	w         http.ResponseWriter
+	// reqBody reads the request body, decoded from base64 if the request is in the
+	// text form. respText says whether the response is in the text form, which the
+	// client chooses; see respondInText.
+	reqBody  *envelopeReader
+	respText bool
+	w        http.ResponseWriter
 }
 
 var _ serverProtocolAdapter = (*grpcWebServerProtocolAdapter)(nil)
 
-func newGRPCWebServerAdapter(req *http.Request, w http.ResponseWriter, codecName string, opts handlerOpts) *grpcWebServerProtocolAdapter {
+func newGRPCWebServerAdapter(req *http.Request, w http.ResponseWriter, codecName string, text bool, opts handlerOpts) *grpcWebServerProtocolAdapter {
+	var body io.Reader = req.Body
+	if text {
+		body = newBase64Reader(req.Body)
+	}
 	return &grpcWebServerProtocolAdapter{
 		codecName: responseCodecName(codecName),
-		reqBody:   newEnvelopeReader(req.Body, opts.recvLimit(), grpcWebFlagTrailers),
-		w:         w,
+		// A request body that is not valid base64 is the client's fault.
+		reqBody:  newEnvelopeReader(body, opts.recvLimit(), grpcWebFlagTrailers, codes.InvalidArgument),
+		respText: respondInText(req.Header, text),
+		w:        w,
 	}
 }
 
 func (g *grpcWebServerProtocolAdapter) streamMessage(data []byte, compressed bool) ([][]byte, error) {
-	return envelopeMessage(data, compressed)
+	frames, err := envelopeMessage(data, compressed)
+	return encodeTextFrameIf(g.respText, frames, err)
 }
 
 func (g *grpcWebServerProtocolAdapter) processHeaders(header http.Header) (requestInfo, error) {
@@ -150,7 +141,7 @@ func (g *grpcWebServerProtocolAdapter) processHeaders(header http.Header) (reque
 func (g *grpcWebServerProtocolAdapter) setResponseHeaders(compressorName string, md metadata.MD) {
 	h := g.w.Header()
 	// Unary and streaming responses are framed alike, so they are labelled alike.
-	h.Set("Content-Type", grpcWebContentTypeFor(g.codecName))
+	h.Set("Content-Type", grpcWebContentTypeFor(g.codecName, g.respText))
 	if !isIdentity(compressorName) {
 		h.Set(grpcEncodingHeader, compressorName)
 	}
@@ -229,6 +220,7 @@ func (g *grpcWebServerProtocolAdapter) finishStream(st *status.Status, trailers 
 // RPC's status and trailing metadata, for unary and streaming calls alike.
 func (g *grpcWebServerProtocolAdapter) writeTrailers(st *status.Status, trailers metadata.MD) {
 	frames, frameErr := envelopeFrame(grpcWebFlagTrailers, grpcWebTrailers(st, trailers))
+	frames, frameErr = encodeTextFrameIf(g.respText, frames, frameErr)
 	if frameErr != nil {
 		return
 	}
@@ -245,6 +237,9 @@ type grpcWebClientProtocolAdapter struct {
 	// maxRecv bounds a single response message; see the field of the same name on
 	// httpGRPCClientProtocolAdapter.
 	maxRecv int
+	// text says whether requests are sent in the text form, which also asks for
+	// responses in it. A response is decoded according to its own content-type.
+	text bool
 	// respBody is created over the response body by processStreamHeaders, and read
 	// by readStreamResponse. respCompressName is the encoding the response named,
 	// which a trailers frame may use as well as a message frame.
@@ -260,8 +255,8 @@ type grpcWebClientProtocolAdapter struct {
 
 var _ clientProtocolAdapter = (*grpcWebClientProtocolAdapter)(nil)
 
-func newGRPCWebClientAdapter(codecName string, maxRecv int) (clientProtocolAdapter, error) {
-	return &grpcWebClientProtocolAdapter{codecName: codecName, maxRecv: maxRecv}, nil
+func newGRPCWebClientAdapter(codecName string, maxRecv int, text bool) (clientProtocolAdapter, error) {
+	return &grpcWebClientProtocolAdapter{codecName: codecName, maxRecv: maxRecv, text: text}, nil
 }
 
 // unaryMessage frames a unary body exactly like a streaming one: this protocol
@@ -271,7 +266,8 @@ func (g *grpcWebClientProtocolAdapter) unaryMessage(data []byte, compressed bool
 }
 
 func (g *grpcWebClientProtocolAdapter) streamMessage(data []byte, compressed bool) ([][]byte, error) {
-	return envelopeMessage(data, compressed)
+	frames, err := envelopeMessage(data, compressed)
+	return encodeTextFrameIf(g.text, frames, err)
 }
 
 func (g *grpcWebClientProtocolAdapter) requestHeaders(ctx context.Context, _ bool, compressorName string, acceptCompressors []string) (http.Header, error) {
@@ -282,7 +278,11 @@ func (g *grpcWebClientProtocolAdapter) requestHeaders(ctx context.Context, _ boo
 	if deadline, ok := ctx.Deadline(); ok {
 		h.Set("GRPC-Timeout", grpcTimeout(deadline))
 	}
-	h.Set("Content-Type", grpcWebContentTypeFor(g.codecName))
+	h.Set("Content-Type", grpcWebContentTypeFor(g.codecName, g.text))
+	if g.text {
+		// The protocol has the client ask for the response form it wants.
+		h.Set("Accept", grpcWebTextContentType)
+	}
 	h.Set("X-Grpc-Web", "1")
 	if !isIdentity(compressorName) {
 		h.Set(grpcEncodingHeader, compressorName)
@@ -294,7 +294,8 @@ func (g *grpcWebClientProtocolAdapter) requestHeaders(ctx context.Context, _ boo
 }
 
 func (g *grpcWebClientProtocolAdapter) processUnaryResponse(resp *http.Response) (unaryResponse, error) {
-	if err := g.checkResponse(resp); err != nil {
+	text, err := g.checkResponse(resp)
+	if err != nil {
 		return unaryResponse{}, err
 	}
 	if isTrailersOnly(resp) {
@@ -312,7 +313,7 @@ func (g *grpcWebClientProtocolAdapter) processUnaryResponse(resp *http.Response)
 
 	// A unary response is a message frame followed by the trailers frame, so both
 	// are read here: the RPC's outcome is only known after the message.
-	body := newEnvelopeReader(resp.Body, g.maxRecv, grpcWebFlagTrailers)
+	body := g.newBodyReader(resp, text)
 	data, compressed, end, err := body.next()
 	if err != nil {
 		if isLimitError(err) {
@@ -353,7 +354,8 @@ func (g *grpcWebClientProtocolAdapter) processUnaryResponse(resp *http.Response)
 }
 
 func (g *grpcWebClientProtocolAdapter) processStreamHeaders(resp *http.Response) (metadata.MD, string, error) {
-	if err := g.checkResponse(resp); err != nil {
+	text, err := g.checkResponse(resp)
+	if err != nil {
 		return nil, "", err
 	}
 	if isTrailersOnly(resp) {
@@ -368,7 +370,7 @@ func (g *grpcWebClientProtocolAdapter) processStreamHeaders(resp *http.Response)
 	if err != nil {
 		return nil, "", err
 	}
-	g.respBody = newEnvelopeReader(resp.Body, g.maxRecv, grpcWebFlagTrailers)
+	g.respBody = g.newBodyReader(resp, text)
 	g.respCompressName = resp.Header.Get(grpcEncodingHeader)
 	return md, g.respCompressName, nil
 }
@@ -423,18 +425,37 @@ func isTrailersOnly(resp *http.Response) bool {
 	return resp.Header.Get(grpcStatusHeader) != ""
 }
 
-// checkResponse rejects a reply that is not a gRPC-Web response at all. This
-// protocol always answers 200 with the outcome in the body or, for a
-// trailers-only response, in the headers, so any other status came from
-// something in between, such as a proxy.
-func (g *grpcWebClientProtocolAdapter) checkResponse(resp *http.Response) error {
+// checkResponse rejects a reply that is not a gRPC-Web response at all, and
+// otherwise reports whether it is in the text form. This protocol always answers
+// 200 with the outcome in the body or, for a trailers-only response, in the
+// headers, so any other status came from something in between, such as a proxy.
+func (g *grpcWebClientProtocolAdapter) checkResponse(resp *http.Response) (text bool, _ error) {
 	if resp.StatusCode != http.StatusOK {
-		return status.Errorf(codeFromHttpStatus(resp.StatusCode),
+		return false, status.Errorf(codeFromHttpStatus(resp.StatusCode),
 			"server replied with HTTP %s", resp.Status)
 	}
 	if isTrailersOnly(resp) && resp.Header.Get("Content-Type") == "" {
 		// A trailers-only response need not label a body it does not have.
-		return nil
+		return false, nil
 	}
-	return checkResponseContentType(resp, g.codecName, grpcWebContentTypeFor(g.codecName), parseGRPCWebContentType)
+	// Either form of the response is accepted, whichever form the request was in:
+	// the server chooses, guided by the Accept header.
+	err := checkResponseContentType(resp, g.codecName, grpcWebContentTypeFor(g.codecName, g.text),
+		func(mediaType string) (string, bool) {
+			codecName, isText, ok := parseGRPCWebContentType(mediaType)
+			text = isText
+			return codecName, ok
+		})
+	return text, err
+}
+
+// newBodyReader returns a reader of the frames of a response body, decoded from
+// base64 if it is in the text form.
+func (g *grpcWebClientProtocolAdapter) newBodyReader(resp *http.Response, text bool) *envelopeReader {
+	var body io.Reader = resp.Body
+	if text {
+		body = newBase64Reader(resp.Body)
+	}
+	// A response body that is not valid base64 is the server's fault.
+	return newEnvelopeReader(body, g.maxRecv, grpcWebFlagTrailers, codes.Internal)
 }

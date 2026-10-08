@@ -22,9 +22,9 @@
 //
 // Two protocols are spoken. The first is this package's own, described in detail below,
 // and is what a Channel uses unless told otherwise. The second is gRPC-Web, which a
-// Channel uses when created with the WithGRPCWeb option. Servers accept both, telling
-// them apart by the request's Content-Type, so a server needs no configuration to serve
-// either. Only the binary form of gRPC-Web is supported, not application/grpc-web-text.
+// Channel uses when created with the WithGRPCWeb option, or WithGRPCWebText for its text
+// form, application/grpc-web-text. Servers accept all of them, telling them apart by the
+// request's Content-Type, so a server needs no configuration to serve any of them.
 //
 // Compression is available only with gRPC-Web, since this package's own protocol has no
 // way to express it.

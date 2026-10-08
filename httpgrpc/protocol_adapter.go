@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -242,7 +243,17 @@ var postOnly = []string{http.MethodPost}
 
 func determineProtocolAdapter(req *http.Request, w http.ResponseWriter, opts handlerOpts) protocolMatch {
 	mediaType, _, _ := mime.ParseMediaType(req.Header.Get("Content-Type"))
-	codecName, isGRPCWeb := parseGRPCWebContentType(mediaType)
+	if codecName, text, ok := parseGRPCWebContentType(mediaType); ok {
+		// Both the binary and the text form; the codec follows the plus sign, and
+		// is proto when there is none.
+		return protocolMatch{
+			adapter:     newGRPCWebServerAdapter(req, w, codecName, text, opts),
+			subFormat:   codecName,
+			allowUnary:  true,
+			allowStream: true,
+			methods:     postOnly,
+		}
+	}
 	switch {
 	case mediaType == ApplicationJson:
 		// Both connectrpc and httpgrpc protocols can use this content type.
@@ -271,17 +282,6 @@ func determineProtocolAdapter(req *http.Request, w http.ResponseWriter, opts han
 		return protocolMatch{
 			adapter:     newHTTPGRPCServerAdapter(req, w, grpcproto.Name, opts),
 			subFormat:   grpcproto.Name,
-			allowStream: true,
-			methods:     postOnly,
-		}
-	case isGRPCWeb:
-		// The codec follows the plus sign, and is proto when there is none. The
-		// text variant, application/grpc-web-text, does not match here: it is not
-		// implemented.
-		return protocolMatch{
-			adapter:     newGRPCWebServerAdapter(req, w, codecName, opts),
-			subFormat:   codecName,
-			allowUnary:  true,
 			allowStream: true,
 			methods:     postOnly,
 		}
@@ -447,10 +447,14 @@ type envelopeReader struct {
 	maxRecv int
 	// endFlag is the flag that marks the final frame.
 	endFlag byte
+	// malformedCode is the code that reports a body which cannot be decoded at
+	// all, as errMalformedText reports one in the text form of gRPC-Web. Which code
+	// that is depends on whose fault it is, the client's or the server's.
+	malformedCode codes.Code
 }
 
-func newEnvelopeReader(r io.Reader, maxRecv int, endFlag byte) *envelopeReader {
-	return &envelopeReader{r: r, maxRecv: maxRecv, endFlag: endFlag}
+func newEnvelopeReader(r io.Reader, maxRecv int, endFlag byte, malformedCode codes.Code) *envelopeReader {
+	return &envelopeReader{r: r, maxRecv: maxRecv, endFlag: endFlag, malformedCode: malformedCode}
 }
 
 // next reads the next frame, reporting its payload, whether that is compressed,
@@ -458,6 +462,9 @@ func newEnvelopeReader(r io.Reader, maxRecv int, endFlag byte) *envelopeReader {
 // cleanly between frames.
 func (e *envelopeReader) next() (data []byte, compressed bool, end bool, err error) {
 	flags, data, err := readEnvelopeFrame(e.r, e.maxRecv)
+	if errors.Is(err, errMalformedText) {
+		return nil, false, false, status.Error(e.malformedCode, err.Error())
+	}
 	if err != nil {
 		return nil, false, false, err
 	}

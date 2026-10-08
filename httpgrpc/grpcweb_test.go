@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"io"
 	"net/http"
@@ -38,6 +39,15 @@ func TestGRPCWeb(t *testing.T) {
 		// The server compresses every response it can, so that the suite runs over
 		// compressed messages and not only small ones that fall under the minimum.
 		ch := newChannel(t, grpcWebServerURL(t, httpgrpc.WithCompressMinBytes(0)), httpgrpc.WithGRPCWeb(),
+			httpgrpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name)))
+		grpchantesting.RunChannelTestCases(t, ch, supportsFullDuplex)
+	})
+	t.Run("text", func(t *testing.T) {
+		ch := newChannel(t, serverURL(t), httpgrpc.WithGRPCWebText())
+		grpchantesting.RunChannelTestCases(t, ch, supportsFullDuplex)
+	})
+	t.Run("text compressed", func(t *testing.T) {
+		ch := newChannel(t, grpcWebServerURL(t, httpgrpc.WithCompressMinBytes(0)), httpgrpc.WithGRPCWebText(),
 			httpgrpc.WithDefaultCallOptions(grpc.UseCompressor(gzip.Name)))
 		grpchantesting.RunChannelTestCases(t, ch, supportsFullDuplex)
 	})
@@ -97,6 +107,85 @@ func TestGRPCWebWireFormat(t *testing.T) {
 	if got := trailerHeaders(t, frames[1].data).Get("Grpc-Status"); got != "0" {
 		t.Errorf("grpc-status = %q, want 0", got)
 	}
+}
+
+// TestGRPCWebTextWireFormat checks the server's handling of the text form against
+// the protocol itself, including what this package's own client never sends: a
+// request body in several separately padded chunks, with line breaks.
+func TestGRPCWebTextWireFormat(t *testing.T) {
+	base := serverURL(t)
+	req := &grpchantesting.Message{Payload: []byte("hello")}
+	reqData, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqFrame := frame(0, reqData)
+	// The frame header and the message are encoded separately, each with its own
+	// padding, and a line break between them.
+	body := base64.StdEncoding.EncodeToString(reqFrame[:5]) + "\r\n" +
+		base64.StdEncoding.EncodeToString(reqFrame[5:])
+
+	checkReply := func(t *testing.T, frames []grpcWebFrame) {
+		t.Helper()
+		if len(frames) != 2 {
+			t.Fatalf("got %d frames, want a message then trailers", len(frames))
+		}
+		var reply grpchantesting.Message
+		if err := proto.Unmarshal(frames[0].data, &reply); err != nil {
+			t.Fatalf("message frame does not hold a message: %v", err)
+		}
+		if !bytes.Equal(reply.Payload, req.Payload) {
+			t.Errorf("payload = %q, want %q", reply.Payload, req.Payload)
+		}
+		if got := trailerHeaders(t, frames[1].data).Get("Grpc-Status"); got != "0" {
+			t.Errorf("grpc-status = %q, want 0", got)
+		}
+	}
+
+	t.Run("text request", func(t *testing.T) {
+		resp := postGRPCWebAs(t, base, "/grpchantesting.TestService/Unary", "application/grpc-web-text", nil, []byte(body))
+		if got := resp.Header.Get("Content-Type"); got != "application/grpc-web-text+proto" {
+			t.Errorf("content-type = %q, want application/grpc-web-text+proto", got)
+		}
+		checkReply(t, readTextFrames(t, resp.Body))
+	})
+	t.Run("binary request asking for text", func(t *testing.T) {
+		header := http.Header{"Accept": []string{"application/grpc-web-text"}}
+		resp := postGRPCWebAs(t, base, "/grpchantesting.TestService/Unary", "application/grpc-web+proto", header, reqFrame)
+		if got := resp.Header.Get("Content-Type"); got != "application/grpc-web-text+proto" {
+			t.Errorf("content-type = %q, want application/grpc-web-text+proto", got)
+		}
+		checkReply(t, readTextFrames(t, resp.Body))
+	})
+	t.Run("malformed text", func(t *testing.T) {
+		resp := postGRPCWebAs(t, base, "/grpchantesting.TestService/Unary", "application/grpc-web-text", nil, []byte("not*base64"))
+		frames := readTextFrames(t, resp.Body)
+		if len(frames) == 0 {
+			t.Fatal("response has no frames")
+		}
+		if got := trailerHeaders(t, frames[len(frames)-1].data).Get("Grpc-Status"); got != "3" {
+			t.Errorf("grpc-status = %q, want 3 (InvalidArgument)", got)
+		}
+	})
+}
+
+// readTextFrames decodes a text-form body, whose padding may fall between
+// chunks, by decoding a group of four characters at a time.
+func readTextFrames(t *testing.T, r io.Reader) []grpcWebFrame {
+	t.Helper()
+	text, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("failed to read response: %v", err)
+	}
+	var decoded []byte
+	for i := 0; i+4 <= len(text); i += 4 {
+		group, err := base64.StdEncoding.DecodeString(string(text[i : i+4]))
+		if err != nil {
+			t.Fatalf("response is not base64: %v", err)
+		}
+		decoded = append(decoded, group...)
+	}
+	return parseFrames(decoded)
 }
 
 // TestGRPCWebCompression checks that messages are really compressed on the wire,
@@ -400,6 +489,12 @@ func trailerHeaders(t *testing.T, data []byte) http.Header {
 // postGRPCWeb sends a gRPC-Web request with the given body, written by hand.
 func postGRPCWeb(t *testing.T, base *url.URL, path string, header http.Header, body []byte) *http.Response {
 	t.Helper()
+	return postGRPCWebAs(t, base, path, "application/grpc-web+proto", header, body)
+}
+
+// postGRPCWebAs is postGRPCWeb with the given content-type.
+func postGRPCWebAs(t *testing.T, base *url.URL, path, contentType string, header http.Header, body []byte) *http.Response {
+	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, base.JoinPath(path).String(), bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -407,7 +502,7 @@ func postGRPCWeb(t *testing.T, base *url.URL, path string, header http.Header, b
 	for k, vs := range header {
 		req.Header[k] = vs
 	}
-	req.Header.Set("Content-Type", "application/grpc-web+proto")
+	req.Header.Set("Content-Type", contentType)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
