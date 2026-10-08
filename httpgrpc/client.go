@@ -45,8 +45,8 @@ type channelOptions struct {
 	codec     encoding.CodecV2
 
 	// newProtocol creates this RPC's protocol adapter. A nil value means the
-	// httpgrpc protocol; WithGRPCWeb sets it, and it is how ConnectRPC will be
-	// selected too. See newAdapter.
+	// httpgrpc protocol; WithGRPCWeb, WithGRPCWebText and WithConnectRPC set it.
+	// See newAdapter.
 	//
 	// protocolCompresses says whether that protocol supports compression, which
 	// is known without creating an adapter. If it does not, no compressor is ever
@@ -136,6 +136,23 @@ func WithGRPCWebText() ChannelOption {
 			return newGRPCWebClientAdapter(codecName, maxRecv, true)
 		}
 		o.protocolCompresses = true
+		return nil
+	}
+}
+
+// WithConnectRPC configures the channel to use the Connect protocol instead of
+// this package's own. Messages are encoded with the channel's codec, which is
+// proto unless WithJSONEncoding says otherwise; and the protocol supports
+// compression, which grpc.UseCompressor selects. Requests are always made with
+// POST, never with the GET the protocol allows for idempotent methods.
+//
+// A server built with this package accepts the Connect protocol without being
+// told to.
+//
+// If more than one option selects a protocol, the last one wins.
+func WithConnectRPC() ChannelOption {
+	return func(o *channelOptions) error {
+		o.newProtocol, o.protocolCompresses = newConnectClientAdapter, true
 		return nil
 	}
 }

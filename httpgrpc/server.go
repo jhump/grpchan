@@ -178,7 +178,9 @@ func (h *handlerOpts) compressMin() int {
 // ErrorRenderer returns a HandlerOption that will cause the handler to use the
 // given function to render an error.  It is only used for unary RPCs since
 // streaming RPCs serialize a status message to the response trailer (in the
-// HTTP body) instead.
+// HTTP body) instead. It is also only used for this package's own protocol:
+// gRPC-Web and Connect define how errors are reported, so they are always
+// reported that way.
 //
 // The function should call methods on response in order to write an error
 // response, including any response headers, the HTTP status code, and any

@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -29,10 +30,10 @@ import (
 // operations (just POST application/json and get application/json back, for
 // example), and others like it, such as gRPC-Web and ConnectRPC.
 //
-// TODO: Implement the ConnectRPC adapters. The httpgrpc and gRPC-Web protocols
-// are implemented so far, which is why parts of this interface have no
-// implementation that exercises them yet: neither accepts anything but POST.
-// Those parts are noted where they appear.
+// TODO: Support GET requests in the Connect protocol, which allows them for
+// unary calls to idempotent methods. That is why parts of this interface have no
+// implementation that exercises them yet: nothing accepts anything but POST so
+// far. Those parts are noted where they appear.
 
 // protocolAdapter contains methods used by both client and server protocols.
 type protocolAdapter interface {
@@ -254,12 +255,22 @@ func determineProtocolAdapter(req *http.Request, w http.ResponseWriter, opts han
 			methods:     postOnly,
 		}
 	}
+	if codecName, ok := strings.CutPrefix(mediaType, connectStreamContentTypePrefix); ok {
+		return protocolMatch{
+			adapter:     newConnectServerAdapter(req, w, codecName, true, opts),
+			subFormat:   codecName,
+			allowStream: true,
+			methods:     postOnly,
+		}
+	}
+	isConnect := req.Header.Get(connectProtocolVersionHeader) != ""
 	switch {
 	case mediaType == ApplicationJson:
-		// Both connectrpc and httpgrpc protocols can use this content type.
-		// So we must look at another header to distinguish.
-		if connectVersion := req.Header.Get("Connect-Protocol-Version"); connectVersion != "" {
-			return notImplementedProtocol()
+		// Both the Connect and httpgrpc protocols use this content type for unary
+		// calls, so it takes another header to tell them apart. Connect clients send
+		// it; a request without it is httpgrpc, as such requests always were.
+		if isConnect {
+			return connectUnaryMatch(req, w, jsonCodecName, opts)
 		}
 		// The httpgrpc protocol accepts JSON for streams as well as for unary calls:
 		// the request body is a sequence of JSON values and the response is encoded
@@ -285,6 +296,12 @@ func determineProtocolAdapter(req *http.Request, w http.ResponseWriter, opts han
 			allowStream: true,
 			methods:     postOnly,
 		}
+	case mediaType == connectUnaryContentTypePrefix+grpcproto.Name:
+		return connectUnaryMatch(req, w, grpcproto.Name, opts)
+	case isConnect && strings.HasPrefix(mediaType, connectUnaryContentTypePrefix):
+		// Any other codec, but only from a client that says it is speaking Connect,
+		// since application/* is otherwise far too broad to claim.
+		return connectUnaryMatch(req, w, strings.TrimPrefix(mediaType, connectUnaryContentTypePrefix), opts)
 	default:
 		return notImplementedProtocol()
 	}
@@ -300,6 +317,17 @@ func responseCodecName(codecName string) string {
 		return grpcproto.Name
 	}
 	return codecName
+}
+
+// connectUnaryMatch claims a request for a unary RPC in the Connect protocol.
+func connectUnaryMatch(req *http.Request, w http.ResponseWriter, codecName string, opts handlerOpts) protocolMatch {
+	return protocolMatch{
+		adapter:    newConnectServerAdapter(req, w, codecName, false, opts),
+		subFormat:  codecName,
+		allowUnary: true,
+		// TODO: the protocol also allows GET, for idempotent methods.
+		methods: postOnly,
+	}
 }
 
 // notImplementedProtocol leaves a content-type unclaimed.

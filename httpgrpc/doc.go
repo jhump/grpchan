@@ -8,8 +8,13 @@
 // request and then proxy it on loopback to the actual GRPC server. So GRPC service
 // handlers are dispatched directly from HTTP server handlers.
 //
-// Clients create a *httpgrpc.Channel value, setting the two required fields to configure
-// it. This value can then be used to create RPC stubs, for sending RPCs to the configured
+// Clients create a *httpgrpc.Channel with NewChannel, which takes the base URL of the
+// server and the transport to reach it with, and options that choose the protocol
+// (WithGRPCWeb, WithGRPCWebText, WithConnectRPC), the message encoding
+// (WithJSONEncoding), and defaults for call options such as message size limits and
+// compression (WithDefaultCallOptions). A Channel built as a struct literal, with its
+// BaseURL and Transport fields set, also works, with every option at its default. The
+// Channel can then be used to create RPC stubs, for sending RPCs to the configured
 // destination.
 //
 // Servers can expose individual methods using httpgrpc.HandleMethod or httpgrpc.HandleStream;
@@ -20,14 +25,18 @@
 //
 // # Protocols
 //
-// Two protocols are spoken. The first is this package's own, described in detail below,
+// Three protocols are spoken. The first is this package's own, described in detail below,
 // and is what a Channel uses unless told otherwise. The second is gRPC-Web, which a
 // Channel uses when created with the WithGRPCWeb option, or WithGRPCWebText for its text
-// form, application/grpc-web-text. Servers accept all of them, telling them apart by the
-// request's Content-Type, so a server needs no configuration to serve any of them.
+// form, application/grpc-web-text. The third is Connect, which a Channel uses when
+// created with the WithConnectRPC option. Servers accept all of them, telling them apart
+// by the request's Content-Type, so a server needs no configuration to serve any of them.
+// A unary JSON request is taken to be Connect only if it has a Connect-Protocol-Version
+// header, since this package's own protocol uses the same content type.
 //
-// Compression is available only with gRPC-Web, since this package's own protocol has no
-// way to express it.
+// Compression is available only with gRPC-Web and Connect, since this package's own
+// protocol has no way to express it. The Connect protocol's GET requests, for idempotent
+// methods, are not supported.
 //
 // # Caveats
 //

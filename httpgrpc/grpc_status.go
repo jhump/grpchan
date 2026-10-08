@@ -30,9 +30,22 @@ const (
 // grpcMetadataToHeaders writes metadata using gRPC's conventions, which differ
 // from httpgrpc's in that a binary value uses standard rather than URL base64.
 func grpcMetadataToHeaders(md metadata.MD, h http.Header) {
+	metadataToHeaders(md, h, "", isReservedGRPCHeader)
+}
+
+// grpcHeadersToMetadata is the inverse of grpcMetadataToHeaders.
+func grpcHeadersToMetadata(h http.Header) (metadata.MD, error) {
+	return headersToMetadata(h, isReservedGRPCHeader, "", nil)
+}
+
+// metadataToHeaders writes metadata as headers using gRPC's conventions, each
+// name with the given prefix. Names that reserved reports as belonging to HTTP or
+// to a protocol are left out, since they would be taken for something other than
+// metadata.
+func metadataToHeaders(md metadata.MD, h http.Header, prefix string, reserved func(lowerK string) bool) {
 	for k, vs := range md {
 		lowerK := strings.ToLower(k)
-		if isReservedGRPCHeader(lowerK) {
+		if reserved(lowerK) {
 			continue
 		}
 		isBin := strings.HasSuffix(lowerK, "-bin")
@@ -40,17 +53,26 @@ func grpcMetadataToHeaders(md metadata.MD, h http.Header) {
 			if isBin {
 				v = base64.RawStdEncoding.EncodeToString([]byte(v))
 			}
-			h.Add(k, v)
+			h.Add(prefix+k, v)
 		}
 	}
 }
 
-// grpcHeadersToMetadata is the inverse of grpcMetadataToHeaders.
-func grpcHeadersToMetadata(h http.Header) (metadata.MD, error) {
+// headersToMetadata is the inverse of metadataToHeaders. If trailers is not nil,
+// headers whose names have trailerPrefix are read into it instead, without the
+// prefix, which is how a protocol can carry trailers in the same block as
+// headers.
+func headersToMetadata(h http.Header, reserved func(lowerK string) bool, trailerPrefix string, trailers metadata.MD) (metadata.MD, error) {
 	md := metadata.MD{}
+	lowerTrailerPrefix := strings.ToLower(trailerPrefix)
 	for k, vs := range h {
 		lowerK := strings.ToLower(k)
-		if isReservedGRPCHeader(lowerK) {
+		target := md
+		if trailers != nil && strings.HasPrefix(lowerK, lowerTrailerPrefix) {
+			lowerK = lowerK[len(lowerTrailerPrefix):]
+			target = trailers
+		}
+		if reserved(lowerK) {
 			continue
 		}
 		for _, v := range vs {
@@ -61,7 +83,7 @@ func grpcHeadersToMetadata(h http.Header) (metadata.MD, error) {
 				}
 				v = string(decoded)
 			}
-			md[lowerK] = append(md[lowerK], v)
+			target[lowerK] = append(target[lowerK], v)
 		}
 	}
 	return md, nil

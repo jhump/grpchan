@@ -492,24 +492,14 @@ func postGRPCWeb(t *testing.T, base *url.URL, path string, header http.Header, b
 	return postGRPCWebAs(t, base, path, "application/grpc-web+proto", header, body)
 }
 
-// postGRPCWebAs is postGRPCWeb with the given content-type.
+// postGRPCWebAs is postGRPCWeb with the given content-type. The response's body
+// has already been read, and is replayed from memory.
 func postGRPCWebAs(t *testing.T, base *url.URL, path, contentType string, header http.Header, body []byte) *http.Response {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, base.JoinPath(path).String(), bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for k, vs := range header {
-		req.Header[k] = vs
-	}
-	req.Header.Set("Content-Type", contentType)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	t.Cleanup(func() { _ = resp.Body.Close() })
+	resp, respBody := postRaw(t, base, path, contentType, header, body)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("HTTP status = %d, want 200", resp.StatusCode)
 	}
+	resp.Body = io.NopCloser(bytes.NewReader(respBody))
 	return resp
 }
