@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,9 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
 
 	"github.com/fullstorydev/grpchan"
 	"github.com/fullstorydev/grpchan/internal"
@@ -314,8 +318,9 @@ func HandleMethod(svr interface{}, serviceName string, desc *grpc.MethodDesc, un
 
 func handleMethod(svr interface{}, serviceName string, desc *grpc.MethodDesc, unaryInt grpc.UnaryServerInterceptor, opts *handlerOpts) http.HandlerFunc {
 	fullMethod := fmt.Sprintf("/%s/%s", serviceName, desc.MethodName)
+	sideEffectFree := isSideEffectFree(serviceName, desc.MethodName)
 	return func(w http.ResponseWriter, r *http.Request) {
-		call, err := beginCall(w, r, opts, false)
+		call, err := beginCall(w, r, opts, false, sideEffectFree)
 		if call == nil {
 			return
 		}
@@ -441,7 +446,7 @@ func handleStream(svr interface{}, serviceName string, desc *grpc.StreamDesc, st
 		IsServerStream: desc.ServerStreams,
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		call, err := beginCall(w, r, opts, true)
+		call, err := beginCall(w, r, opts, true, false)
 		if call == nil {
 			return
 		}
@@ -530,7 +535,7 @@ type serverCall struct {
 // is reported in that protocol's error format, which would otherwise leave the
 // client without an RPC status. A non-nil error is such a failure, and the call
 // is still valid for reporting it.
-func beginCall(w http.ResponseWriter, r *http.Request, opts *handlerOpts, isStream bool) (*serverCall, error) {
+func beginCall(w http.ResponseWriter, r *http.Request, opts *handlerOpts, isStream, sideEffectFree bool) (*serverCall, error) {
 	match := determineProtocolAdapter(r, w, *opts)
 	if match.adapter == nil {
 		writeError(w, http.StatusUnsupportedMediaType)
@@ -542,6 +547,26 @@ func beginCall(w http.ResponseWriter, r *http.Request, opts *handlerOpts, isStre
 		call.ctx = peer.NewContext(call.ctx, p)
 	}
 
+	// Every protocol accepts POST. One may also accept GET for a unary call, but
+	// only to a method declared free of side effects: a GET can be repeated by a
+	// cache or a retry, and made from another site with the caller's credentials,
+	// neither of which is safe for a method that changes anything.
+	methods := []string{http.MethodPost}
+	if match.allowsGet && !isStream && sideEffectFree {
+		methods = append(methods, http.MethodGet)
+	}
+	if !slices.Contains(methods, r.Method) {
+		w.Header().Set("Allow", strings.Join(methods, ", "))
+		if match.httpMethodErrors {
+			// Connect has no RPC status for this; connect-go answers with a bare 405,
+			// and so does this.
+			writeError(w, http.StatusMethodNotAllowed)
+			return nil, nil
+		}
+		return call, status.Errorf(codes.Unimplemented,
+			"%s is not allowed, use %s", r.Method, strings.Join(methods, " or "))
+	}
+
 	kind, allowed := "unary", match.allowUnary
 	if isStream {
 		kind, allowed = "streaming", match.allowStream
@@ -550,20 +575,18 @@ func beginCall(w http.ResponseWriter, r *http.Request, opts *handlerOpts, isStre
 		return call, status.Errorf(codes.Unimplemented,
 			"content-type %q cannot be used for a %s RPC", r.Header.Get("Content-Type"), kind)
 	}
-	if !match.allowsMethod(r.Method) {
-		w.Header().Set("Allow", strings.Join(match.methods, ", "))
-		return call, status.Errorf(codes.Unimplemented,
-			"%s is not allowed, use %s", r.Method, strings.Join(match.methods, " or "))
+
+	// Headers are processed before the codec is looked up, so that a request
+	// missing what names its codec is told that, rather than that its codec is
+	// unknown.
+	reqInfo, err := call.protocol.processHeaders(r.Header)
+	if err != nil {
+		return call, status.Error(codes.InvalidArgument, err.Error())
 	}
 
 	call.codec = encoding.GetCodecV2(match.subFormat)
 	if call.codec == nil {
 		return call, status.Errorf(codes.Unimplemented, "unsupported message format: %q", match.subFormat)
-	}
-
-	reqInfo, err := call.protocol.processHeaders(r.Header)
-	if err != nil {
-		return call, status.Error(codes.InvalidArgument, err.Error())
 	}
 	call.ctx = metadata.NewIncomingContext(call.ctx, reqInfo.metadata)
 	if reqInfo.hasTimeout {
@@ -592,6 +615,27 @@ func errorStatus(err error) *status.Status {
 		st = status.FromProto(stpb)
 	}
 	return st
+}
+
+// isSideEffectFree reports whether the named method is declared free of side
+// effects, with the idempotency_level option set to NO_SIDE_EFFECTS. That is
+// found in the method's descriptor, which generated code registers; a method whose
+// descriptor is not registered is taken to have side effects.
+func isSideEffectFree(serviceName, methodName string) bool {
+	desc, err := protoregistry.GlobalFiles.FindDescriptorByName(protoreflect.FullName(serviceName))
+	if err != nil {
+		return false
+	}
+	service, ok := desc.(protoreflect.ServiceDescriptor)
+	if !ok {
+		return false
+	}
+	method := service.Methods().ByName(protoreflect.Name(methodName))
+	if method == nil {
+		return false
+	}
+	options, ok := method.Options().(*descriptorpb.MethodOptions)
+	return ok && options.GetIdempotencyLevel() == descriptorpb.MethodOptions_NO_SIDE_EFFECTS
 }
 
 func peerFromRequest(r *http.Request) *peer.Peer {

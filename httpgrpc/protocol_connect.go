@@ -2,11 +2,13 @@ package httpgrpc
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -25,8 +27,10 @@ import (
 // JSON object with the RPC's outcome and trailing metadata. Their compression is
 // negotiated with headers of their own, and their HTTP status is always 200.
 //
-// The protocol also allows a unary request to be made with GET, for idempotent
-// methods. That is not implemented.
+// A unary request may also be made with GET, to a method free of side effects,
+// so that it can be cached. The message, its codec and its compression are then
+// in the query string, since there is no body. Servers accept such requests; a
+// Channel always uses POST.
 
 const (
 	// connectUnaryContentTypePrefix is as broad as it looks: a unary request is
@@ -36,7 +40,14 @@ const (
 	connectUnaryContentTypePrefix  = "application/"
 	connectStreamContentTypePrefix = "application/connect+"
 
-	connectProtocolVersionHeader           = "Connect-Protocol-Version"
+	connectProtocolVersionHeader = "Connect-Protocol-Version"
+
+	// The query parameters of a GET request.
+	connectGetVersionParam                 = "connect"
+	connectGetEncodingParam                = "encoding"
+	connectGetMessageParam                 = "message"
+	connectGetBase64Param                  = "base64"
+	connectGetCompressionParam             = "compression"
 	connectTimeoutHeader                   = "Connect-Timeout-Ms"
 	connectUnaryEncodingHeader             = "Content-Encoding"
 	connectUnaryAcceptEncodingHeader       = "Accept-Encoding"
@@ -166,6 +177,9 @@ type connectServerProtocolAdapter struct {
 	// headers say, since the body is compressed as a whole.
 	contentLength int64
 	reqCompressed bool
+	// query is the query string of a GET request, which carries the message in
+	// place of a body; it is nil for any other request.
+	query url.Values
 
 	// w is the response writer this adapter owns.
 	w http.ResponseWriter
@@ -174,6 +188,17 @@ type connectServerProtocolAdapter struct {
 var _ serverProtocolAdapter = (*connectServerProtocolAdapter)(nil)
 
 func newConnectServerAdapter(req *http.Request, w http.ResponseWriter, codecName string, stream bool, opts handlerOpts) *connectServerProtocolAdapter {
+	if req.Method == http.MethodGet {
+		query := req.URL.Query()
+		return &connectServerProtocolAdapter{
+			codecName:     responseCodecName(codecName),
+			maxRecv:       opts.recvLimit(),
+			reqBody:       req.Body,
+			reqCompressed: !isIdentity(query.Get(connectGetCompressionParam)),
+			query:         query,
+			w:             w,
+		}
+	}
 	return &connectServerProtocolAdapter{
 		codecName:     responseCodecName(codecName),
 		stream:        stream,
@@ -206,6 +231,17 @@ func (c *connectServerProtocolAdapter) processHeaders(header http.Header) (reque
 		compressorName:    header.Get(encodingHeader),
 		acceptCompressors: parseAcceptEncoding(header.Values(acceptHeader)),
 	}
+	if c.query != nil {
+		// A GET names its message's compression in the query string. The version
+		// parameter is optional, but one that names another version is refused.
+		if version := c.query.Get(connectGetVersionParam); version != "" && version != "v1" {
+			return requestInfo{}, fmt.Errorf("unsupported connect protocol version %q", version)
+		}
+		if !c.query.Has(connectGetEncodingParam) {
+			return requestInfo{}, fmt.Errorf("missing %q query parameter", connectGetEncodingParam)
+		}
+		info.compressorName = c.query.Get(connectGetCompressionParam)
+	}
 	info.timeout, info.hasTimeout = connectTimeout(header)
 	return info, nil
 }
@@ -227,12 +263,39 @@ func (c *connectServerProtocolAdapter) setResponseHeaders(stream bool, compresso
 }
 
 func (c *connectServerProtocolAdapter) processUnaryRequest() ([]byte, bool, error) {
+	if c.query != nil {
+		return c.queryMessage()
+	}
 	// The body is the whole message, as in httpgrpc, so when the request declares
 	// its length, an over-large one can be refused without reading any of it. It
 	// is compressed as a whole, so whether it is compressed is said by the
 	// request's headers; processHeaders has already reported which encoding.
 	data, err := readBodyLimited(c.reqBody, c.contentLength, c.maxRecv)
 	return data, c.reqCompressed, err
+}
+
+// queryMessage returns the message of a GET request, which is in the query
+// string: as it is, or base64-encoded, URL-safe and with or without padding.
+func (c *connectServerProtocolAdapter) queryMessage() ([]byte, bool, error) {
+	if !c.query.Has(connectGetMessageParam) {
+		return nil, false, status.Errorf(codes.InvalidArgument, "missing %q query parameter", connectGetMessageParam)
+	}
+	message := c.query.Get(connectGetMessageParam)
+	data := []byte(message)
+	if c.query.Get(connectGetBase64Param) == "1" {
+		var err error
+		data, err = base64.RawURLEncoding.DecodeString(strings.TrimRight(message, "="))
+		if err != nil {
+			return nil, false, status.Errorf(codes.InvalidArgument, "malformed base64 in %q query parameter: %v", connectGetMessageParam, err)
+		}
+	}
+	// The URL has already been read, within the server's limit on the size of a
+	// request's headers, so this cannot refuse it before it is in memory; it can
+	// still refuse a message larger than the handler accepts.
+	if err := checkRecvSize(len(data), c.maxRecv); err != nil {
+		return nil, false, err
+	}
+	return data, c.reqCompressed, nil
 }
 
 // writeUnary reports the RPC's outcome with the HTTP status, and a failure as a

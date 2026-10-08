@@ -6,7 +6,16 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
+	"sync"
 	"testing"
+
+	"github.com/fullstorydev/grpchan/grpchantesting"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoregistry"
+	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 // postRaw sends a request written by hand, and returns the response and its
@@ -33,4 +42,47 @@ func postRaw(t *testing.T, base *url.URL, path, contentType string, header http.
 		t.Fatalf("failed to read response: %v", err)
 	}
 	return resp, respBody
+}
+
+// sideEffectFreeServiceName is the name of the test service as registered by
+// sideEffectFreeService.
+const sideEffectFreeServiceName = "grpchantesting.sideeffectfree.TestService"
+
+var registerSideEffectFree sync.Once
+
+// sideEffectFreeService returns the test service under another name, whose
+// descriptor declares its Unary method free of side effects. The descriptor is a
+// copy of the generated one with that option added, registered once, so that one
+// implementation can be served both with the option and without it.
+func sideEffectFreeService(t *testing.T) *grpc.ServiceDesc {
+	t.Helper()
+	registerSideEffectFree.Do(func() {
+		orig := protodesc.ToFileDescriptorProto(grpchantesting.File_test_proto)
+		service := proto.Clone(orig.GetService()[0]).(*descriptorpb.ServiceDescriptorProto)
+		for _, method := range service.GetMethod() {
+			if method.GetName() == "Unary" {
+				method.Options = &descriptorpb.MethodOptions{
+					IdempotencyLevel: descriptorpb.MethodOptions_NO_SIDE_EFFECTS.Enum(),
+				}
+			}
+		}
+		// The copy depends on the original for its message types, so that only the
+		// service is redefined.
+		file, err := protodesc.NewFile(&descriptorpb.FileDescriptorProto{
+			Name:       proto.String("grpchantesting/test_side_effect_free.proto"),
+			Package:    proto.String("grpchantesting.sideeffectfree"),
+			Dependency: append(slices.Clone(orig.GetDependency()), orig.GetName()),
+			Service:    []*descriptorpb.ServiceDescriptorProto{service},
+			Syntax:     orig.Syntax,
+		}, protoregistry.GlobalFiles)
+		if err != nil {
+			t.Fatalf("failed to build descriptor: %v", err)
+		}
+		if err := protoregistry.GlobalFiles.RegisterFile(file); err != nil {
+			t.Fatalf("failed to register descriptor: %v", err)
+		}
+	})
+	desc := grpchantesting.TestService_ServiceDesc
+	desc.ServiceName = sideEffectFreeServiceName
+	return &desc
 }

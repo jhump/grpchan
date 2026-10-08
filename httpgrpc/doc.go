@@ -35,8 +35,12 @@
 // header, since this package's own protocol uses the same content type.
 //
 // Compression is available only with gRPC-Web and Connect, since this package's own
-// protocol has no way to express it. The Connect protocol's GET requests, for idempotent
-// methods, are not supported.
+// protocol has no way to express it.
+//
+// Servers also accept the GET requests the Connect protocol allows for a unary call to a
+// method declared free of side effects, with the idempotency_level option set to
+// NO_SIDE_EFFECTS; a GET to any other method is refused with HTTP status 405. A Channel
+// always uses POST.
 //
 // # Caveats
 //
