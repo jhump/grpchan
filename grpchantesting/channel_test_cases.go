@@ -26,14 +26,102 @@ import (
 //
 // The test cases will be defined as child tests by invoking t.Run on the given
 // *testing.T.
+//
+// To run only some of the test cases, use a ChannelTester instead.
 func RunChannelTestCases(t *testing.T, ch grpc.ClientConnInterface, supportsFullDuplex bool) {
-	cli := NewTestServiceClient(ch)
-	t.Run("unary", func(t *testing.T) { testUnary(t, cli) })
-	t.Run("client-stream", func(t *testing.T) { testClientStream(t, cli) })
-	t.Run("server-stream", func(t *testing.T) { testServerStream(t, cli) })
-	t.Run("half-duplex bidi-stream", func(t *testing.T) { testHalfDuplexBidiStream(t, cli) })
-	if supportsFullDuplex {
-		t.Run("full-duplex bidi-stream", func(t *testing.T) { testFullDuplexBidiStream(t, cli) })
+	NewChannelTester(ch).Run(t, UnaryTests(), ClientStreamTests(), ServerStreamTests(),
+		BidiStreamTests(supportsFullDuplex))
+}
+
+// ChannelTester runs the test cases of RunChannelTestCases, or a chosen subset of
+// them, against a channel. It is for a channel or a server that cannot handle
+// every kind of RPC.
+type ChannelTester struct {
+	cli TestServiceClient
+}
+
+// NewChannelTester returns a ChannelTester for the given channel, which has the
+// same requirements as one given to RunChannelTestCases.
+func NewChannelTester(ch grpc.ClientConnInterface) *ChannelTester {
+	return &ChannelTester{cli: NewTestServiceClient(ch)}
+}
+
+// ChannelTesterOption chooses what a ChannelTester runs.
+type ChannelTesterOption func(*testOptions)
+
+type testOptions struct {
+	unary, clientStream, serverStream, bidiStream bool
+	fullDuplex                                    bool
+	trailersOnlyFailures                          bool
+}
+
+// UnaryTests includes the test cases for unary RPCs.
+func UnaryTests() ChannelTesterOption {
+	return func(o *testOptions) { o.unary = true }
+}
+
+// ClientStreamTests includes the test cases for client-streaming RPCs.
+func ClientStreamTests() ChannelTesterOption {
+	return func(o *testOptions) { o.clientStream = true }
+}
+
+// ServerStreamTests includes the test cases for server-streaming RPCs.
+func ServerStreamTests() ChannelTesterOption {
+	return func(o *testOptions) { o.serverStream = true }
+}
+
+// BidiStreamTests includes the test cases for bidirectional-streaming RPCs. The
+// half-duplex cases are always included; the full-duplex ones only if fullDuplex
+// is true, since a channel needs to support it for them to pass.
+func BidiStreamTests(fullDuplex bool) ChannelTesterOption {
+	return func(o *testOptions) {
+		o.bidiStream = true
+		o.fullDuplex = fullDuplex
+	}
+}
+
+// newTestOptions applies the given options, defaulting to every kind of RPC when
+// none is chosen.
+func newTestOptions(opts []ChannelTesterOption) testOptions {
+	var o testOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if !o.unary && !o.clientStream && !o.serverStream && !o.bidiStream {
+		o.unary, o.clientStream, o.serverStream, o.bidiStream = true, true, true, true
+	}
+	return o
+}
+
+// TrailersOnlyFailures relaxes the checks of calls that fail before the server
+// sends a response message, for a server that reports such a failure as a
+// "trailers-only" response. That merges the response's header metadata into its
+// trailers, where no client can tell them apart, so the expected header metadata
+// is accepted in either place.
+func TrailersOnlyFailures() ChannelTesterOption {
+	return func(o *testOptions) { o.trailersOnlyFailures = true }
+}
+
+// Run runs the chosen test cases as child tests of t. They run in the same order
+// as in RunChannelTestCases, whatever order the options are given in. With no
+// options, every kind of RPC is tested, with bidirectional streams tested only as
+// half duplex.
+func (c *ChannelTester) Run(t *testing.T, opts ...ChannelTesterOption) {
+	o := newTestOptions(opts)
+	if o.unary {
+		t.Run("unary", func(t *testing.T) { testUnary(t, c.cli, o) })
+	}
+	if o.clientStream {
+		t.Run("client-stream", func(t *testing.T) { testClientStream(t, c.cli, o) })
+	}
+	if o.serverStream {
+		t.Run("server-stream", func(t *testing.T) { testServerStream(t, c.cli) })
+	}
+	if o.bidiStream {
+		t.Run("half-duplex bidi-stream", func(t *testing.T) { testHalfDuplexBidiStream(t, c.cli) })
+		if o.fullDuplex {
+			t.Run("full-duplex bidi-stream", func(t *testing.T) { testFullDuplexBidiStream(t, c.cli) })
+		}
 	}
 }
 
@@ -95,7 +183,7 @@ func MetadataNew(m map[string][]byte) metadata.MD {
 	return md
 }
 
-func testUnary(t *testing.T, cli TestServiceClient) {
+func testUnary(t *testing.T, cli TestServiceClient, o testOptions) {
 	ctx := metadata.NewOutgoingContext(context.Background(), MetadataNew(testOutgoingMd))
 	reqPrototype := Message{
 		Payload:  testPayload,
@@ -127,7 +215,7 @@ func testUnary(t *testing.T, cli TestServiceClient) {
 		checkError(t, err, codes.AlreadyExists, testErrorMessages...)
 
 		// A failed call still reports its metadata.
-		checkMetadata(t, testMdHeaders, hdr, "header")
+		checkFailureHeaders(t, o, hdr, tlr)
 		checkMetadata(t, testMdTrailers, tlr, "trailer")
 	})
 
@@ -151,7 +239,7 @@ func testUnary(t *testing.T, cli TestServiceClient) {
 	})
 }
 
-func testClientStream(t *testing.T, cli TestServiceClient) {
+func testClientStream(t *testing.T, cli TestServiceClient, o testOptions) {
 	ctx := metadata.NewOutgoingContext(context.Background(), MetadataNew(testOutgoingMd))
 	reqPrototype := Message{
 		Payload:  testPayload,
@@ -212,7 +300,12 @@ func testClientStream(t *testing.T, cli TestServiceClient) {
 		_, err = cs.CloseAndRecv()
 		checkError(t, err, codes.ResourceExhausted, testErrorMessages...)
 
-		checkResponseMetadata(t, cs, testMdHeaders, testMdTrailers)
+		hdr, err := cs.Header()
+		if err != nil {
+			t.Fatalf("failed to get header metadata: %v", err)
+		}
+		checkFailureHeaders(t, o, hdr, cs.Trailer())
+		checkResponseTrailers(t, cs, testMdTrailers)
 	})
 
 	t.Run("timeout", func(t *testing.T) {
@@ -675,6 +768,16 @@ func checkRequestHeaders(t *testing.T, expected, actual map[string][]byte) {
 			t.Fatalf("wrong headers echoed back: expecting header %s to be %q, instead was %q", k, v, v2)
 		}
 	}
+}
+
+// checkFailureHeaders checks the header metadata of a call that failed before
+// the server sent a response message; see TrailersOnlyFailures.
+func checkFailureHeaders(t *testing.T, o testOptions, hdr, tlr metadata.MD) {
+	t.Helper()
+	if o.trailersOnlyFailures {
+		hdr = metadata.Join(hdr, tlr)
+	}
+	checkMetadata(t, testMdHeaders, hdr, "header")
 }
 
 func checkResponseMetadata(t *testing.T, cs grpc.ClientStream, hdrs map[string][]byte, tlrs map[string][]byte) {

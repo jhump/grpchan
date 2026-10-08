@@ -36,3 +36,38 @@ func TestChannelTestCases(t *testing.T) {
 
 	RunChannelTestCases(t, cc, true)
 }
+
+func TestNewTestOptions(t *testing.T) {
+	testCases := []struct {
+		desc string
+		opts []ChannelTesterOption
+		want testOptions
+	}{
+		{
+			desc: "none means every kind of RPC, half duplex",
+			want: testOptions{unary: true, clientStream: true, serverStream: true, bidiStream: true},
+		},
+		{
+			desc: "only the kinds chosen",
+			opts: []ChannelTesterOption{UnaryTests(), ServerStreamTests()},
+			want: testOptions{unary: true, serverStream: true},
+		},
+		{
+			desc: "full duplex",
+			opts: []ChannelTesterOption{BidiStreamTests(true)},
+			want: testOptions{bidiStream: true, fullDuplex: true},
+		},
+		{
+			desc: "trailers-only failures alone still tests everything",
+			opts: []ChannelTesterOption{TrailersOnlyFailures()},
+			want: testOptions{unary: true, clientStream: true, serverStream: true, bidiStream: true, trailersOnlyFailures: true},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.desc, func(t *testing.T) {
+			if got := newTestOptions(testCase.opts); got != testCase.want {
+				t.Errorf("newTestOptions() = %+v, want %+v", got, testCase.want)
+			}
+		})
+	}
+}
