@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"path"
 	"strconv"
@@ -576,30 +577,48 @@ func contextFromHeaders(parent context.Context, h http.Header) (context.Context,
 	ctx := metadata.NewIncomingContext(parent, md)
 
 	// deadline propagation
-	timeout := h.Get("GRPC-Timeout")
-	if timeout != "" {
-		// See GRPC wire format, "Timeout" component of request: https://grpc.io/docs/guides/wire.html#requests
-		suffix := timeout[len(timeout)-1]
-		if timeoutVal, err := strconv.ParseInt(timeout[:len(timeout)-1], 10, 64); err == nil {
-			var unit time.Duration
-			switch suffix {
-			case 'H':
-				unit = time.Hour
-			case 'M':
-				unit = time.Minute
-			case 'S':
-				unit = time.Second
-			case 'm':
-				unit = time.Millisecond
-			case 'u':
-				unit = time.Microsecond
-			case 'n':
-				unit = time.Nanosecond
-			}
-			if unit != 0 {
-				ctx, cancel = context.WithTimeout(ctx, time.Duration(timeoutVal)*unit)
-			}
-		}
+	if timeout, ok := timeoutFromHeaders(h); ok {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 	}
 	return ctx, cancel, nil
+}
+
+// timeoutFromHeaders returns the timeout named by the GRPC-Timeout header, if
+// there is a valid one. The format is gRPC's: see the "Timeout" component of a
+// request at https://grpc.io/docs/guides/wire.html#requests.
+func timeoutFromHeaders(h http.Header) (time.Duration, bool) {
+	timeout := h.Get("GRPC-Timeout")
+	if timeout == "" {
+		return 0, false
+	}
+	suffix := timeout[len(timeout)-1]
+	timeoutVal, err := strconv.ParseInt(timeout[:len(timeout)-1], 10, 64)
+	// The format only allows a positive value. A negative one would otherwise
+	// make a deadline that has already passed, failing the call before it starts.
+	if err != nil || timeoutVal < 0 {
+		return 0, false
+	}
+	var unit time.Duration
+	switch suffix {
+	case 'H':
+		unit = time.Hour
+	case 'M':
+		unit = time.Minute
+	case 'S':
+		unit = time.Second
+	case 'm':
+		unit = time.Millisecond
+	case 'u':
+		unit = time.Microsecond
+	case 'n':
+		unit = time.Nanosecond
+	default:
+		return 0, false
+	}
+	if timeoutVal > math.MaxInt64/int64(unit) {
+		// Too long to represent, and so effectively no timeout at all. Multiplying
+		// would wrap around, often to a negative duration that fails the call.
+		return 0, false
+	}
+	return time.Duration(timeoutVal) * unit, true
 }
