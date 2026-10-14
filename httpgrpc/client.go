@@ -508,7 +508,31 @@ func (cs *clientStream) SendMsg(m interface{}) error {
 	}
 
 	cs.wErr = cs.streamWriter(m, false)
+	var marshalErr marshalError
+	if errors.As(cs.wErr, &marshalErr) {
+		// Like gRPC-Go, a message that can't be encoded ends the RPC, since nothing
+		// else will: the server is left waiting for the message. Failures to write
+		// are left alone, since they mean the RPC is already ending, and RecvMsg is
+		// where its real result is reported.
+		cs.wErr = status.Errorf(codes.Internal, "could not marshal message: %v", marshalErr.err)
+		cs.endStream(cs.wErr)
+	}
 	return cs.wErr
+}
+
+// endStream records why the RPC ended and tears down the request.
+//
+// The error is recorded first so that it is what a subsequent RecvMsg reports.
+// Cancelling alone would leave the reader to fill in a cancellation instead,
+// which explains far less.
+func (cs *clientStream) endStream(err error) {
+	cs.rMu.Lock()
+	if cs.rErr == nil {
+		cs.rErr = err
+	}
+	cs.done = true
+	cs.rMu.Unlock()
+	cs.cancel()
 }
 
 func (cs *clientStream) RecvMsg(m interface{}) error {

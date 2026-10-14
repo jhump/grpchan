@@ -36,7 +36,7 @@ func writeSizePreface(w io.Writer, sz int32) error {
 func writeProtoMessage(w io.Writer, codec encoding.CodecV2, m interface{}, end bool) error {
 	buf, err := codec.Marshal(m)
 	if err != nil {
-		return err
+		return marshalError{err}
 	}
 	b := buf.Materialize()
 
@@ -60,6 +60,20 @@ func writeProtoMessage(w io.Writer, codec encoding.CodecV2, m interface{}, end b
 		}
 	}
 	return err
+}
+
+// marshalError is returned by a stream writer for a message that could not be
+// encoded, to tell it apart from a failure to write the encoded message.
+type marshalError struct {
+	err error
+}
+
+func (e marshalError) Error() string {
+	return e.err.Error()
+}
+
+func (e marshalError) Unwrap() error {
+	return e.err
 }
 
 // readSizePreface reads a 32-bit size from the given reader. If the value is
@@ -243,7 +257,7 @@ func newJSONWriter(w io.Writer, codec encoding.CodecV2) func(m any, isTrailer bo
 
 		data, err := codec.Marshal(m)
 		if err != nil {
-			return err
+			return marshalError{err}
 		}
 
 		_, err = w.Write(data.Materialize())

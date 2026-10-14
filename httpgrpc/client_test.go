@@ -2,15 +2,19 @@ package httpgrpc_test
 
 import (
 	"context"
+	"io"
 	"net/http/httptest"
 	"net/url"
 	"testing"
+	"time"
 
 	"github.com/fullstorydev/grpchan/grpchantesting"
 	"github.com/fullstorydev/grpchan/httpgrpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
 
 // TestPeerTLSInfo checks that a call over TLS reports the connection's TLS
@@ -60,4 +64,44 @@ func TestPeerTLSInfo(t *testing.T) {
 		}
 		checkPeer(t, &p)
 	})
+}
+
+// TestSendMsgMarshalErrorEndsStream checks that a message the client can't
+// encode ends the RPC, rather than leaving both sides waiting for it.
+func TestSendMsgMarshalErrorEndsStream(t *testing.T) {
+	svr := httpgrpc.NewServer()
+	grpchantesting.RegisterTestServiceServer(svr, &grpchantesting.TestServer{})
+	httpServer := httptest.NewServer(svr)
+	defer httpServer.Close()
+
+	u, err := url.Parse(httpServer.URL)
+	if err != nil {
+		t.Fatalf("failed to parse base URL: %v", err)
+	}
+	ch, err := httpgrpc.NewChannel(u, httpServer.Client().Transport)
+	if err != nil {
+		t.Fatalf("failed to create channel: %v", err)
+	}
+	cli := grpchantesting.NewTestServiceClient(ch)
+
+	// If the RPC isn't ended, it stays open until this deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stream, err := cli.BidiStream(ctx)
+	if err != nil {
+		t.Fatalf("RPC failed: %v", err)
+	}
+	sendErr := stream.SendMsg("not a proto message")
+	if sendErr == nil {
+		t.Fatal("SendMsg of a message that can't be encoded succeeded")
+	}
+	if _, err := stream.Recv(); err == nil || err.Error() != sendErr.Error() {
+		t.Fatalf("Recv: got %v, want the error from SendMsg: %v", err, sendErr)
+	}
+	if status.Code(sendErr) != codes.Internal {
+		t.Fatalf("SendMsg: got %v, want an Internal error", sendErr)
+	}
+	if err := stream.Send(&grpchantesting.Message{}); err != io.EOF {
+		t.Fatalf("Send after the stream ended: got %v, want io.EOF", err)
+	}
 }
