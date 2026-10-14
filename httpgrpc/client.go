@@ -200,7 +200,7 @@ func (ch *Channel) Invoke(ctx context.Context, methodName string, req, resp inte
 	}()
 
 	if len(copts.Peer) > 0 {
-		copts.SetPeer(getPeer(ch.BaseURL, r.TLS))
+		copts.SetPeer(getPeer(ch.BaseURL, reply.TLS))
 	}
 
 	// gather headers and trailers
