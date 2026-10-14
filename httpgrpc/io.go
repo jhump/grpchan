@@ -105,6 +105,7 @@ func asMetadata(header http.Header) (metadata.MD, error) {
 var reservedHeaders = map[string]struct{}{
 	"accept-encoding":   {},
 	"connection":        {},
+	"content-encoding":  {},
 	"content-type":      {},
 	"content-length":    {},
 	"keep-alive":        {},
@@ -114,12 +115,23 @@ var reservedHeaders = map[string]struct{}{
 	"upgrade":           {},
 }
 
+// isReservedHeader reports whether the given lower-case header name belongs to
+// HTTP or to this protocol, and so cannot be sent as metadata: the peer would
+// take it for something other than metadata. The protocol's own headers are
+// GRPC-Timeout and those that start with "X-GRPC-", for status, details and
+// unary trailers.
+func isReservedHeader(lowerK string) bool {
+	if _, ok := reservedHeaders[lowerK]; ok {
+		return true
+	}
+	return lowerK == "grpc-timeout" || strings.HasPrefix(lowerK, "x-grpc-")
+}
+
 func toHeaders(md metadata.MD, h http.Header, prefix string) {
 	// binary headers must be base-64-encoded
 	for k, vs := range md {
 		lowerK := strings.ToLower(k)
-		if _, ok := reservedHeaders[lowerK]; ok {
-			// ignore reserved header keys
+		if isReservedHeader(lowerK) {
 			continue
 		}
 		isBin := strings.HasSuffix(lowerK, "-bin")
